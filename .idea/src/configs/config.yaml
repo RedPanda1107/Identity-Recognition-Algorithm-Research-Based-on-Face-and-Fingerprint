@@ -1,0 +1,40 @@
+# 训练配置
+training:
+  epochs: 100
+  batch_size: 32
+  learning_rate: 0.001
+  weight_decay: 1e-4
+  momentum: 0.9
+  scheduler_step: 30
+  scheduler_gamma: 0.1
+
+# 模型配置
+model:
+  face_embedding_dim: 512
+  finger_embedding_dim: 512
+  num_classes: 100
+  fusion_method: 'concat'  # 'concat', 'add', 'attention'
+  pretrained: true
+
+# 数据配置
+data:
+  face_image_size: 224
+  finger_image_size: 224
+  train_split: 0.7
+  val_split: 0.2
+  test_split: 0.1
+
+# 路径配置
+paths:
+  data_dir: './data'
+  checkpoint_dir: './checkpoints'
+  log_dir: './logs'
+  config_dir: './configs'
+
+# 其他配置
+misc:
+  seed: 42
+  num_workers: 4
+  save_freq: 10
+  log_freq: 10
+  use_amp: true  # 混合精度训练

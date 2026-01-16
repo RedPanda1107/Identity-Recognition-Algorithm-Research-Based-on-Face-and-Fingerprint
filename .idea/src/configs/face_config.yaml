@@ -1,0 +1,61 @@
+# 单模态人脸识别配置文件
+# 专为毕业论文单模态人脸识别实验设计
+
+# 训练配置
+training:
+  epochs: 50  # 单模态训练可以使用较少的epoch
+  batch_size: 32
+  learning_rate: 0.001
+  weight_decay: 1e-4
+  momentum: 0.9
+  scheduler_step: 20  # 每20个epoch衰减学习率
+  scheduler_gamma: 0.1
+
+# 模型配置（单模态人脸识别）
+model:
+  model_type: 'facenet'  # 'facenet' 或 'facenet_arcface'
+  face_embedding_dim: 512
+  num_classes: 100  # 根据您的数据集类别数调整
+  pretrained: true  # 使用ImageNet预训练权重
+  dropout_rate: 0.5
+
+# 数据配置
+data:
+  face_image_size: 224
+  use_augmentation: true  # 是否使用数据增强
+  augmentation:
+    random_horizontal_flip: true
+    random_rotation: 10
+    color_jitter: true
+    random_crop: false
+
+# 路径配置
+paths:
+  data_dir: './data'
+  face_data_dir: './data/face/face'
+  checkpoint_dir: './checkpoints/face'  # 人脸模型检查点目录
+  log_dir: './logs/face'  # 人脸识别日志目录
+  config_dir: './configs'
+  results_dir: './results/face'  # 测试结果目录
+
+# 其他配置
+misc:
+  seed: 42
+  num_workers: 4  # 根据CPU核心数调整
+  save_freq: 5  # 每5个epoch保存一次检查点
+  log_freq: 10  # 每10个batch记录一次日志
+  use_amp: true  # 使用混合精度训练加速
+  experiment_name: 'face_recognition_baseline'  # 实验名称
+
+# 实验配置（用于消融实验）
+experiment:
+  ablation_study: false  # 是否进行消融实验
+  test_time_augmentation: false  # 测试时数据增强
+  save_features: false  # 是否保存特征向量
+  evaluate_every_epoch: true  # 每个epoch都进行验证
+
+# 调试配置
+debug:
+  debug_mode: false
+  max_samples: null  # 限制训练样本数量用于调试
+  log_images: false  # 是否记录图像到TensorBoard
