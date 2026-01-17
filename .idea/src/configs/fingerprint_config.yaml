@@ -15,7 +15,7 @@ training:
 model:
   model_type: 'fingerprint_net'  # 指纹网络类型
   embedding_dim: 256  # 指纹特征嵌入维度
-  num_classes: 100  # 根据您的数据集类别数调整
+  num_classes: 600  # 根据您的数据集类别数调整
   pretrained: false  # 指纹识别通常不需要预训练权重
   dropout_rate: 0.5
 
@@ -32,7 +32,7 @@ data:
 # 路径配置
 paths:
   data_dir: './data'
-  fingerprint_data_dir: './data/fingerprint'
+  fingerprint_data_dir: './data/fingerprint/fingerprint/organized'  # 指向整理后的指纹数据
   checkpoint_dir: './checkpoints/fingerprint'  # 指纹模型检查点目录
   log_dir: './logs/fingerprint'  # 指纹识别日志目录
   config_dir: './configs'

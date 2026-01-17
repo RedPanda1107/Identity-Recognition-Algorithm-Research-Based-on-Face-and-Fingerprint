@@ -76,6 +76,7 @@ class BaseTrainer:
         pbar = tqdm(self.val_loader, desc=f"Epoch {epoch+1} [Val]", leave=False)
         all_preds = []
         all_labels = []
+        all_probs = []  # 新增：收集预测概率
         for batch in pbar:
             # Get inputs - prefer 'image' key, fallback to 'input'
             inputs = batch.get("image", batch.get("input"))
@@ -88,6 +89,8 @@ class BaseTrainer:
             outputs = self.model(inputs)
             loss = self.criterion(outputs, targets)
 
+            # 计算预测概率
+            probs = torch.nn.functional.softmax(outputs, dim=1)
             preds = outputs.argmax(dim=1)
             acc = (preds == targets).float().mean().item()
 
@@ -96,6 +99,7 @@ class BaseTrainer:
 
             all_preds.extend(preds.cpu().tolist())
             all_labels.extend(targets.cpu().tolist())
+            all_probs.extend(probs.cpu().tolist())  # 保存预测概率
 
             pbar.set_postfix({"loss": f"{loss_meter.avg:.4f}", "acc": f"{acc_meter.avg:.4f}"})
 
@@ -107,7 +111,14 @@ class BaseTrainer:
         except Exception:
             precision = recall = f1 = 0.0  # fallback for single-class cases
 
-        metrics = {"precision": precision, "recall": recall, "f1_score": f1}
+        metrics = {
+            "precision": precision,
+            "recall": recall,
+            "f1_score": f1,
+            "predictions": all_preds,
+            "labels": all_labels,
+            "probabilities": all_probs  # 新增：返回预测概率
+        }
         return loss_meter.avg, acc_meter.avg, metrics
 
     def save_checkpoint(self, path, extra=None):

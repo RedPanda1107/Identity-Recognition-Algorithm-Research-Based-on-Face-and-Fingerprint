@@ -16,10 +16,12 @@ import torch.optim as optim
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
-from core.utils import load_config, set_seed, get_device, count_parameters, setup_logger
+from core.utils import load_config, set_seed, get_device, count_parameters, setup_logger, calculate_biometric_metrics, save_biometric_results
 from core.datasets.fusion_dataset import FusionDataset
 from core.models import create_model
 from core.trainers.fusion_trainer import FusionTrainer
+import json
+from datetime import datetime
 
 
 def parse_args():
@@ -157,6 +159,18 @@ def main():
         tb_writer=None
     )
 
+    # 初始化训练历史记录
+    training_history = {
+        "experiment_name": args.experiment_name,
+        "model_type": "fusion",
+        "start_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "config": config,
+        "epochs": []
+    }
+
+    # 获取类别数量用于生物识别指标计算
+    num_classes = len(train_dataset.class_to_idx)
+
     # Training loop
     start_epoch = 0
     best_acc = 0.0
@@ -168,6 +182,15 @@ def main():
         train_loss, train_acc = trainer.train_epoch(epoch)
         val_loss, val_acc, val_metrics = trainer.validate_epoch(epoch)
 
+        # 计算生物识别指标
+        biometric_results = None
+        if "probabilities" in val_metrics and "labels" in val_metrics:
+            biometric_results = calculate_biometric_metrics(
+                val_metrics["labels"],
+                val_metrics["probabilities"],
+                num_classes=num_classes
+            )
+
         scheduler.step()
 
         logger.info(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
@@ -176,14 +199,51 @@ def main():
                    f"Recall: {val_metrics['recall']:.4f}, "
                    f"F1: {val_metrics['f1_score']:.4f}")
 
+        # 记录当前epoch的历史数据
+        epoch_data = {
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+            "train_acc": train_acc,
+            "val_loss": val_loss,
+            "val_acc": val_acc,
+            "learning_rate": optimizer.param_groups[0]['lr'],
+            "val_metrics": {
+                k: v for k, v in val_metrics.items()
+                if k not in ["predictions", "labels", "probabilities"]  # 不保存大数据
+            }
+        }
+
+        if biometric_results:
+            epoch_data["biometric_metrics"] = {
+                "eer": biometric_results.get("macro_avg", {}).get("eer", 0),
+                "auc": biometric_results.get("macro_avg", {}).get("auc", 0)
+            }
+            # 保存详细的生物识别结果
+            biometric_dir = os.path.join(config["paths"].get("log_dir", "./logs"), args.experiment_name, "biometric_results")
+            os.makedirs(biometric_dir, exist_ok=True)
+            biometric_path = os.path.join(biometric_dir, f"epoch_{epoch+1}_biometric.json")
+            save_biometric_results(biometric_results, biometric_path)
+
+        training_history["epochs"].append(epoch_data)
+
         # Save best model
         if val_acc > best_acc:
             best_acc = val_acc
             ckpt_dir = config["paths"].get("checkpoint_dir", "./checkpoints")
             os.makedirs(ckpt_dir, exist_ok=True)
-            ckpt_path = os.path.join(ckpt_dir, f"fusion_best_epoch_{epoch+1}.pth")
+            ckpt_path = os.path.join(ckpt_dir, "fusion", f"best_epoch_{epoch+1}.pth")
             trainer.save_checkpoint(ckpt_path, extra={"epoch": epoch + 1, "val_acc": val_acc})
             logger.info(f"Saved best fusion checkpoint: {ckpt_path}")
+
+    # 保存完整的训练历史
+    history_dir = os.path.join(config["paths"].get("log_dir", "./logs"), args.experiment_name)
+    os.makedirs(history_dir, exist_ok=True)
+    history_path = os.path.join(history_dir, "training_history.json")
+    with open(history_path, 'w', encoding='utf-8') as f:
+        json.dump(training_history, f, indent=2, ensure_ascii=False, default=str)
+
+    logger.info(f"Training completed. Best validation accuracy: {best_acc:.4f}")
+    logger.info(f"Training history saved to: {history_path}")
 
 
 if __name__ == "__main__":

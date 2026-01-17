@@ -4,8 +4,8 @@ import logging
 import yaml
 import torch
 import torch.nn as nn
-from torch.utils.tensorboard import SummaryWriter
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
+from torch.utils.tensorboard.writer import SummaryWriter
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix, roc_curve, auc
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -120,22 +120,27 @@ def calculate_metrics(y_true, y_pred, num_classes=None):
 
     # 精确率、召回率、F1分数
     precision, recall, f1, support = precision_recall_fscore_support(
-        y_true, y_pred, average='macro', zero_division=0
+        y_true, y_pred, average='macro', zero_division='warn'
     )
 
     # 每类精确率、召回率、F1分数
     precision_per_class, recall_per_class, f1_per_class, _ = precision_recall_fscore_support(
-        y_true, y_pred, average=None, zero_division=0
+        y_true, y_pred, average=None, zero_division='warn'
     )
+
+    # 确保类型正确
+    precision_per_class = np.array(precision_per_class)
+    recall_per_class = np.array(recall_per_class)
+    f1_per_class = np.array(f1_per_class)
 
     metrics = {
         'accuracy': accuracy,
         'precision': precision,
         'recall': recall,
         'f1_score': f1,
-        'precision_per_class': precision_per_class.tolist() if num_classes else None,
-        'recall_per_class': recall_per_class.tolist() if num_classes else None,
-        'f1_per_class': f1_per_class.tolist() if num_classes else None
+        'precision_per_class': list(precision_per_class) if num_classes else None,
+        'recall_per_class': list(recall_per_class) if num_classes else None,
+        'f1_per_class': list(f1_per_class) if num_classes else None
     }
 
     return metrics
@@ -189,6 +194,265 @@ def plot_training_curves(train_losses, val_losses, train_accs, val_accs, save_pa
         plt.close()
     else:
         plt.show()
+
+
+def calculate_biometric_metrics(y_true, y_prob, num_classes=None):
+    """
+    计算生物识别指标 (FAR, FRR, EER等)
+
+    Args:
+        y_true: 真实标签
+        y_prob: 预测概率 [n_samples, n_classes]
+        num_classes: 类别数量
+
+    Returns:
+        dict: 包含各种生物识别指标
+    """
+    import numpy as np
+
+    if num_classes is None:
+        num_classes = len(np.unique(y_true))
+
+    results = {}
+
+    # 对于每个类别，计算该类别vs其他类别的FAR/FRR
+    all_fars = []
+    all_frrs = []
+    all_eers = []
+    all_auc_scores = []
+
+    for class_idx in range(num_classes):
+        # 将当前类别设为正类，其他类别设为负类
+        y_binary = (np.array(y_true) == class_idx).astype(int)
+        y_score = np.array(y_prob)[:, class_idx] if len(np.array(y_prob).shape) > 1 else np.array(y_prob)
+
+        # 计算ROC曲线
+        fpr, tpr, thresholds = roc_curve(y_binary, y_score)
+        auc_score = auc(fpr, tpr)
+
+        # 计算FAR (FPR) 和 FRR (1 - TPR)
+        far = fpr  # False Acceptance Rate
+        frr = 1 - tpr  # False Rejection Rate
+
+        # 计算EER (Equal Error Rate)
+        eer_idx = np.argmin(np.abs(far - frr))
+        eer = (far[eer_idx] + frr[eer_idx]) / 2
+
+        all_fars.append(far)
+        all_frrs.append(frr)
+        all_eers.append(eer)
+        all_auc_scores.append(auc_score)
+
+        results[f'class_{class_idx}'] = {
+            'far': far.tolist(),
+            'frr': frr.tolist(),
+            'thresholds': thresholds.tolist(),
+            'eer': eer,
+            'auc': auc_score
+        }
+
+    # 计算平均指标
+    results['macro_avg'] = {
+        'eer': np.mean(all_eers),
+        'auc': np.mean(all_auc_scores)
+    }
+
+    # 计算整体EER (所有类别一起考虑)
+    # 使用最大预测概率作为分数，所有样本设为正类进行简化计算
+    y_score_flat = np.max(y_prob, axis=1) if len(np.array(y_prob).shape) > 1 else np.array(y_prob)
+    y_binary_overall = np.ones(len(y_true))  # 所有样本都是正类
+
+    try:
+        fpr_overall, tpr_overall, _ = roc_curve(y_binary_overall, y_score_flat)
+        eer_overall = (fpr_overall[np.argmin(np.abs(fpr_overall - (1-tpr_overall)))] +
+                       (1-tpr_overall)[np.argmin(np.abs(fpr_overall - (1-tpr_overall)))]) / 2
+        auc_overall = auc(fpr_overall, tpr_overall)
+    except Exception:
+        eer_overall = np.mean(all_eers) if all_eers else 0.0
+        auc_overall = np.mean(all_auc_scores) if all_auc_scores else 0.0
+
+    results['overall'] = {
+        'eer': eer_overall,
+        'auc': auc_overall
+    }
+
+    return results
+
+
+def plot_roc_curves(biometric_results, save_path=None, figsize=(10, 8)):
+    """
+    绘制ROC曲线
+
+    Args:
+        biometric_results: calculate_biometric_metrics的返回值
+        save_path: 保存路径
+        figsize: 图表大小
+    """
+    plt.figure(figsize=figsize)
+
+    colors = plt.cm.get_cmap('tab10')(np.linspace(0, 1, 10))
+
+    for i, (class_name, metrics) in enumerate(biometric_results.items()):
+        if class_name in ['macro_avg', 'overall']:
+            continue
+
+        if 'far' in metrics and 'frr' in metrics:
+            far = np.array(metrics['far'])
+            frr = np.array(metrics['frr'])
+
+            # ROC曲线: TPR vs FPR, 而FRR = 1 - TPR, 所以TPR = 1 - FRR
+            tpr = 1 - frr
+            fpr = far
+
+            auc_score = metrics.get('auc', 0)
+            plt.plot(fpr, tpr, color=colors[i % len(colors)],
+                    label=f'{class_name} (AUC={auc_score:.3f})')
+
+    plt.plot([0, 1], [0, 1], 'k--', alpha=0.5, label='Random')
+    plt.xlabel('False Acceptance Rate (FAR)')
+    plt.ylabel('True Acceptance Rate (TAR)')
+    plt.title('ROC Curves')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.axis('equal')
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+    else:
+        plt.show()
+
+
+def plot_det_curves(biometric_results, save_path=None, figsize=(10, 8)):
+    """
+    绘制检测误差权衡曲线 (DET曲线)
+
+    Args:
+        biometric_results: calculate_biometric_metrics的返回值
+        save_path: 保存路径
+        figsize: 图表大小
+    """
+    plt.figure(figsize=figsize)
+
+    colors = plt.cm.get_cmap('tab10')(np.linspace(0, 1, 10))
+
+    for i, (class_name, metrics) in enumerate(biometric_results.items()):
+        if class_name in ['macro_avg', 'overall']:
+            continue
+
+        if 'far' in metrics and 'frr' in metrics:
+            far = np.array(metrics['far'])
+            frr = np.array(metrics['frr'])
+
+            # DET曲线在双对数坐标系中绘制FAR vs FRR
+            # 过滤掉0值以避免log(0)
+            valid_idx = (far > 0) & (frr > 0)
+            far_valid = far[valid_idx]
+            frr_valid = frr[valid_idx]
+
+            if len(far_valid) > 0:
+                eer = metrics.get('eer', 0)
+                plt.plot(far_valid, frr_valid, color=colors[i % len(colors)],
+                        label=f'{class_name} (EER={eer:.3f})')
+
+    plt.xlabel('False Acceptance Rate (FAR)')
+    plt.ylabel('False Rejection Rate (FRR)')
+    plt.title('Detection Error Tradeoff (DET) Curves')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.xscale('log')
+    plt.yscale('log')
+
+    # 添加EER等值线
+    eer_levels = [0.001, 0.01, 0.1]
+    for eer in eer_levels:
+        plt.plot([eer, 1], [eer, eer], 'k:', alpha=0.3)
+        plt.plot([eer, eer], [eer, 1], 'k:', alpha=0.3)
+
+    plt.axis('equal')
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+    else:
+        plt.show()
+
+
+def plot_far_frr_curves(biometric_results, save_path=None, figsize=(12, 5)):
+    """
+    绘制FAR和FRR随阈值变化的曲线
+
+    Args:
+        biometric_results: calculate_biometric_metrics的返回值
+        save_path: 保存路径
+        figsize: 图表大小
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
+
+    colors = plt.cm.get_cmap('tab10')(np.linspace(0, 1, 10))
+
+    for i, (class_name, metrics) in enumerate(biometric_results.items()):
+        if class_name in ['macro_avg', 'overall']:
+            continue
+
+        if 'far' in metrics and 'frr' in metrics and 'thresholds' in metrics:
+            thresholds = np.array(metrics['thresholds'])
+            far = np.array(metrics['far'])
+            frr = np.array(metrics['frr'])
+            eer = metrics.get('eer', 0)
+
+            # FAR vs Threshold
+            ax1.plot(thresholds, far, color=colors[i % len(colors)],
+                    label=f'{class_name} (EER={eer:.3f})')
+
+            # FRR vs Threshold
+            ax2.plot(thresholds, frr, color=colors[i % len(colors)],
+                    label=f'{class_name} (EER={eer:.3f})')
+
+    ax1.set_xlabel('Threshold')
+    ax1.set_ylabel('False Acceptance Rate (FAR)')
+    ax1.set_title('FAR vs Threshold')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    ax2.set_xlabel('Threshold')
+    ax2.set_ylabel('False Rejection Rate (FRR)')
+    ax2.set_title('FRR vs Threshold')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+    else:
+        plt.show()
+
+
+def save_biometric_results(biometric_results, save_path):
+    """
+    保存生物识别指标结果到JSON文件
+
+    Args:
+        biometric_results: calculate_biometric_metrics的返回值
+        save_path: 保存路径
+    """
+    # 将numpy数组转换为list以便JSON序列化
+    serializable_results = {}
+    for key, value in biometric_results.items():
+        if isinstance(value, dict):
+            serializable_results[key] = {}
+            for sub_key, sub_value in value.items():
+                if isinstance(sub_value, np.ndarray):
+                    serializable_results[key][sub_key] = sub_value.tolist()
+                else:
+                    serializable_results[key][sub_key] = sub_value
+        else:
+            serializable_results[key] = value
+
+    with open(save_path, 'w', encoding='utf-8') as f:
+        json.dump(serializable_results, f, indent=2, ensure_ascii=False)
 
 
 def set_seed(seed=42):
