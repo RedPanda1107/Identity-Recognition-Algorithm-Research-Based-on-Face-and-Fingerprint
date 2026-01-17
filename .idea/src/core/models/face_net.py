@@ -21,7 +21,11 @@ class FaceNet(nn.Module):
         self.embedding_dim = embedding_dim
 
         # 加载预训练的ResNet模型
-        self.backbone = models.resnet50(pretrained=pretrained)
+        if pretrained:
+            weights = models.ResNet50_Weights.IMAGENET1K_V1
+        else:
+            weights = None
+        self.backbone = models.resnet50(weights=weights)
 
         # 获取原始的全连接层输入特征数
         num_features = self.backbone.fc.in_features

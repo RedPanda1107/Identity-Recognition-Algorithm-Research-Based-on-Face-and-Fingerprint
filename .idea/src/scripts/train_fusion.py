@@ -44,7 +44,8 @@ def main():
     logger = setup_logger(
         experiment_name=args.experiment_name,
         log_dir=config["paths"].get("log_dir", "./logs"),
-        level=config.get("logging", {}).get("level", "INFO")
+        level=config.get("logging", {}).get("level", "INFO"),
+        logger_name="FusionRecognition"
     )
 
     set_seed(config.get("misc", {}).get("seed", 42))

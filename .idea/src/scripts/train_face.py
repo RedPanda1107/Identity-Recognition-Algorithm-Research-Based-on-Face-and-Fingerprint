@@ -38,14 +38,14 @@ def main():
 
     # Use experiment name from config if available, otherwise use command line argument
     experiment_name = config.get("misc", {}).get("experiment_name", args.experiment_name)
-    logger = setup_logger(experiment_name=experiment_name, log_dir=config["paths"].get("log_dir", "./logs"), level="INFO")
+    logger = setup_logger(experiment_name=experiment_name, log_dir=config["paths"].get("log_dir", "./logs"), level="INFO", logger_name="FaceRecognition")
 
     set_seed(config.get("misc", {}).get("seed", 42))
     device = get_device(args.device)
     logger.info(f"Using device: {device}")
 
     # Convert relative path to absolute path relative to project root
-    face_data_dir = config["paths"]["data_dir"]
+    face_data_dir = config["paths"]["face_data_dir"]
     if not os.path.isabs(face_data_dir):
         # If relative path, make it relative to project root
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

@@ -3,7 +3,7 @@
 
 # 训练配置
 training:
-  epochs: 50  # 单模态训练可以使用较少的epoch
+  epochs: 1  # 单模态训练可以使用较少的epoch
   batch_size: 32
   learning_rate: 0.001
   weight_decay: 1e-4
@@ -41,7 +41,7 @@ paths:
 # 其他配置
 misc:
   seed: 42
-  num_workers: 4  # 根据CPU核心数调整
+  num_workers: 0  # 设置为0避免多进程数据加载问题
   save_freq: 5  # 每5个epoch保存一次检查点
   log_freq: 10  # 每10个batch记录一次日志
   use_amp: true  # 使用混合精度训练加速

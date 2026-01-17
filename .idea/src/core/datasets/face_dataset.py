@@ -3,6 +3,8 @@ import torch
 from torch.utils.data import Dataset
 from PIL import Image
 import torchvision.transforms as transforms
+import random
+import numpy as np
 
 
 class FaceDataset(Dataset):
@@ -34,15 +36,28 @@ class FaceDataset(Dataset):
         class_names = sorted([d for d in os.listdir(self.data_dir)
                              if os.path.isdir(os.path.join(self.data_dir, d))])
 
+        # Collect all samples
+        all_samples = []
         for idx, class_name in enumerate(class_names):
             self.class_to_idx[class_name] = idx
             class_dir = os.path.join(self.data_dir, class_name)
 
+            class_samples = []
             for img_name in os.listdir(class_dir):
                 if img_name.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
                     img_path = os.path.join(class_dir, img_name)
-                    self.image_paths.append(img_path)
-                    self.labels.append(idx)
+                    class_samples.append((img_path, idx))
+
+            # Split samples for this class (70% train, 30% val)
+            random.shuffle(class_samples)
+            n_train = int(len(class_samples) * 0.7)
+            train_samples = class_samples[:n_train]
+            val_samples = class_samples[n_train:]
+
+            all_samples.extend(train_samples if self.mode == 'train' else val_samples)
+
+        # Set the samples for this dataset
+        self.image_paths, self.labels = zip(*all_samples) if all_samples else ([], [])
 
     def _get_default_transform(self):
         if self.mode == 'train':

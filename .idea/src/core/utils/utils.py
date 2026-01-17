@@ -13,7 +13,7 @@ from datetime import datetime
 import json
 
 
-def setup_logger(log_dir='./logs', log_file='training.log', level=logging.INFO, experiment_name=None):
+def setup_logger(log_dir='./logs', log_file='training.log', level=logging.INFO, experiment_name=None, logger_name='Training'):
     """设置日志记录器"""
     # 如果提供了实验名称，在日志目录下创建子目录
     if experiment_name:
@@ -23,7 +23,7 @@ def setup_logger(log_dir='./logs', log_file='training.log', level=logging.INFO, 
         os.makedirs(log_dir)
 
     # 创建logger
-    logger = logging.getLogger('FaceRecognition')
+    logger = logging.getLogger(logger_name)
     logger.setLevel(level)
 
     # 避免重复添加handler

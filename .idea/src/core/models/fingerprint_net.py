@@ -21,7 +21,11 @@ class FingerprintNet(nn.Module):
         self.embedding_dim = embedding_dim
 
         # Use ResNet34 for fingerprint recognition (lighter than ResNet50 for face)
-        self.backbone = models.resnet34(pretrained=pretrained)
+        if pretrained:
+            weights = models.ResNet34_Weights.IMAGENET1K_V1
+        else:
+            weights = None
+        self.backbone = models.resnet34(weights=weights)
 
         # Get the original fully connected layer input features
         num_features = self.backbone.fc.in_features

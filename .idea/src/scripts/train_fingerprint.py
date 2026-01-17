@@ -43,7 +43,7 @@ def main():
 
     # Use experiment name from config if available, otherwise use command line argument
     experiment_name = config.get("misc", {}).get("experiment_name", args.experiment_name)
-    logger = setup_logger(experiment_name=experiment_name, log_dir=config["paths"].get("log_dir", "./logs"), level="INFO")
+    logger = setup_logger(experiment_name=experiment_name, log_dir=config["paths"].get("log_dir", "./logs"), level="INFO", logger_name="FingerprintRecognition")
 
     set_seed(config.get("misc", {}).get("seed", 42))
     device = get_device(args.device)

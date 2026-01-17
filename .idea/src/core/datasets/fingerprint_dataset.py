@@ -39,11 +39,14 @@ class FingerprintDataset(Dataset):
         person_dirs = sorted([d for d in os.listdir(self.data_dir)
                              if os.path.isdir(os.path.join(self.data_dir, d))])
 
+        # Collect all samples
+        all_samples = []
         for idx, person_id in enumerate(person_dirs):
             self.class_to_idx[person_id] = idx
             person_dir = os.path.join(self.data_dir, person_id)
 
             # Collect images from both left and right hand directories
+            person_samples = []
             for hand in ['left', 'right']:
                 hand_dir = os.path.join(person_dir, hand)
                 if not os.path.exists(hand_dir):
@@ -52,8 +55,18 @@ class FingerprintDataset(Dataset):
                 for finger_file in os.listdir(hand_dir):
                     if finger_file.lower().endswith('.bmp'):
                         img_path = os.path.join(hand_dir, finger_file)
-                        self.image_paths.append(img_path)
-                        self.labels.append(idx)
+                        person_samples.append((img_path, idx))
+
+            # Split samples for this person (70% train, 30% val)
+            random.shuffle(person_samples)
+            n_train = int(len(person_samples) * 0.7)
+            train_samples = person_samples[:n_train]
+            val_samples = person_samples[n_train:]
+
+            all_samples.extend(train_samples if self.mode == 'train' else val_samples)
+
+        # Set the samples for this dataset
+        self.image_paths, self.labels = zip(*all_samples) if all_samples else ([], [])
 
     def _get_transform(self):
         """Get appropriate transforms for fingerprint images."""
