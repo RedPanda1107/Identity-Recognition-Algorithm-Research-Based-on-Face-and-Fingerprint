@@ -1,3 +1,4 @@
+import os
 import torch
 from .base_trainer import BaseTrainer, AverageMeter
 
@@ -6,11 +7,21 @@ class FusionTrainer(BaseTrainer):
     """多模态融合训练器
 
     支持人脸+指纹特征提取和融合训练
+    支持加载预训练的单模态模型权重
     """
 
     def __init__(self, fusion_model, face_model, fingerprint_model,
                  train_loader, val_loader, optimizer, scheduler, criterion,
-                 device, logger, tb_writer=None):
+                 device, logger, tb_writer=None, pretrained_ckpts=None):
+        """初始化融合训练器
+
+        Args:
+            pretrained_ckpts: 预训练检查点路径字典，例如:
+                {
+                    'face': 'checkpoints/face/best_model.pth',
+                    'fingerprint': 'checkpoints/fingerprint/best_model.pth'
+                }
+        """
         # 初始化父类
         super(FusionTrainer, self).__init__(
             fusion_model, train_loader, val_loader, optimizer, scheduler,
@@ -21,6 +32,10 @@ class FusionTrainer(BaseTrainer):
         self.face_model = face_model.to(device) if face_model else None
         self.fingerprint_model = fingerprint_model.to(device) if fingerprint_model else None
 
+        # 加载预训练权重
+        if pretrained_ckpts:
+            self._load_pretrained_weights(pretrained_ckpts)
+
         # 设置特征提取器为评估模式
         if self.face_model:
             self.face_model.eval()
@@ -29,6 +44,35 @@ class FusionTrainer(BaseTrainer):
 
         # 冻结特征提取器的参数
         self._freeze_feature_extractors()
+
+    def _load_pretrained_weights(self, pretrained_ckpts):
+        """加载预训练的单模态模型权重"""
+        if 'face' in pretrained_ckpts and pretrained_ckpts['face'] and self.face_model:
+            face_ckpt_path = pretrained_ckpts['face']
+            if os.path.exists(face_ckpt_path):
+                try:
+                    ckpt = torch.load(face_ckpt_path, map_location=self.device)
+                    # 尝试加载模型权重
+                    if 'model_state' in ckpt:
+                        self.face_model.load_state_dict(ckpt['model_state'])
+                    else:
+                        self.face_model.load_state_dict(ckpt)
+                    self.logger.info(f"[FusionTrainer] 加载人脸预训练权重: {face_ckpt_path}")
+                except Exception as e:
+                    self.logger.warning(f"[FusionTrainer] 加载人脸权重失败: {e}")
+
+        if 'fingerprint' in pretrained_ckpts and pretrained_ckpts['fingerprint'] and self.fingerprint_model:
+            fp_ckpt_path = pretrained_ckpts['fingerprint']
+            if os.path.exists(fp_ckpt_path):
+                try:
+                    ckpt = torch.load(fp_ckpt_path, map_location=self.device)
+                    if 'model_state' in ckpt:
+                        self.fingerprint_model.load_state_dict(ckpt['model_state'])
+                    else:
+                        self.fingerprint_model.load_state_dict(ckpt)
+                    self.logger.info(f"[FusionTrainer] 加载指纹预训练权重: {fp_ckpt_path}")
+                except Exception as e:
+                    self.logger.warning(f"[FusionTrainer] 加载指纹权重失败: {e}")
 
     def _freeze_feature_extractors(self):
         """冻结特征提取器参数"""

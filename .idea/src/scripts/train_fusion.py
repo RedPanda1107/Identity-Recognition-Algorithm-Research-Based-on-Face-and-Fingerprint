@@ -37,6 +37,10 @@ def parse_args():
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--fusion_method", type=str, default="concat",
                        choices=['concat', 'attention_fusion', 'cross_attention', 'tensor_fusion'])
+    parser.add_argument("--face_ckpt", type=str, default=None,
+                       help="Path to pretrained face model checkpoint")
+    parser.add_argument("--fp_ckpt", type=str, default=None,
+                       help="Path to pretrained fingerprint model checkpoint")
     return parser.parse_args()
 
 
@@ -195,7 +199,12 @@ def main():
         gamma=float(config["training"].get("scheduler_gamma", 0.1))
     )
 
-    # Create trainer
+    # Create trainer - pass pretrained checkpoints
+    pretrained_ckpts = {
+        'face': args.face_ckpt,
+        'fingerprint': args.fp_ckpt
+    }
+
     trainer = FusionTrainer(
         fusion_model=fusion_model,
         face_model=face_model,
@@ -207,7 +216,8 @@ def main():
         criterion=criterion,
         device=device,
         logger=logger,
-        tb_writer=None
+        tb_writer=None,
+        pretrained_ckpts=pretrained_ckpts
     )
 
     # 初始化训练历史记录
