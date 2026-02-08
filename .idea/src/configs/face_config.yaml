@@ -3,36 +3,43 @@
 
 # 训练配置
 training:
-  epochs: 1  # 单模态训练可以使用较少的epoch
+  epochs: 50  # 增加训练轮次以便更充分训练
   batch_size: 32
-  learning_rate: 0.001
-  weight_decay: 1e-4
-  momentum: 0.9
+  learning_rate: 1e-4  # 改为较小的初始学习率，建议与 Adam 配合使用
+  weight_decay: 5e-4  # 增强正则化以减少过拟合
+  optimizer: 'adam'    # 切换为 Adam 优化器
   scheduler_step: 20  # 每20个epoch衰减学习率
   scheduler_gamma: 0.1
+  warmup_epochs: 1    # 线性 warmup epoch 数
+  freeze_backbone_epochs: 0  # 关闭 backbone 冻结，让整个网络从第1个epoch开始训练
 
 # 模型配置（单模态人脸识别）
 model:
-  model_type: 'facenet'  # 'facenet' 或 'facenet_arcface'
-  face_embedding_dim: 512
+  model_type: 'facenet_arcface'  # 'facenet' 或 'facenet_arcface'
+  embedding_dim: 512
   num_classes: 100  # 根据您的数据集类别数调整
   pretrained: true  # 使用ImageNet预训练权重
-  dropout_rate: 0.5
+  dropout_rate: 0.6  # 稍微加大dropout以缓解过拟合
+  # ArcFace 参数（可在 config 中调整）
+  arc_s: 30.0
+  arc_m: 0.1
 
 # 数据配置
 data:
-  face_image_size: 224
+  image_size: 224
   use_augmentation: true  # 是否使用数据增强
   augmentation:
     random_horizontal_flip: true
     random_rotation: 10
     color_jitter: true
     random_crop: false
+    random_resized_crop: true
+    random_erasing_prob: 0.2  # 使用RandomErasing增强鲁棒性
 
 # 路径配置
 paths:
   data_dir: './data'
-  face_data_dir: './data/face/face'
+  modality_data_dir: './data/face/face'
   checkpoint_dir: './checkpoints/face'  # 人脸模型检查点目录
   log_dir: './logs/face'  # 人脸识别日志目录
   config_dir: './configs'
@@ -46,6 +53,8 @@ misc:
   log_freq: 10  # 每10个batch记录一次日志
   use_amp: true  # 使用混合精度训练加速
   experiment_name: 'face_recognition_baseline'  # 实验名称
+  early_stopping: true
+  early_stopping_patience: 5
 
 # 实验配置（用于消融实验）
 experiment:

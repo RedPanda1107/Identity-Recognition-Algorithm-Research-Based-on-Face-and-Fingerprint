@@ -3,36 +3,50 @@
 
 # 训练配置
 training:
-  epochs: 1  # 单模态训练可以使用较少的epoch
+  epochs: 50  # 增加训练轮次以便更充分训练
   batch_size: 32
-  learning_rate: 0.001
-  weight_decay: 1e-4
-  momentum: 0.9
-  scheduler_step: 20  # 每20个epoch衰减学习率
-  scheduler_gamma: 0.1
+  learning_rate: 1e-4  # 使用较小的学习率，配合预训练模型
+  weight_decay: 5e-4
+  optimizer: 'adam'    # 使用Adam优化器
+  momentum: 0.9        # SGD动量（仅当optimizer: 'sgd'时使用）
+  scheduler_step: 10   # 每10个epoch衰减学习率
+  scheduler_gamma: 0.5  # 较大学习率衰减
+  warmup_epochs: 2      # 增加warmup epoch数
+  metric_learning: true  # 是否使用度量学习(ArcFace)训练指纹embedding
+  arc_s: 30.0  # ArcFace scale, 增大以增强类间差异
+  arc_m: 0.5    # ArcFace margin, 增大以增强分类边界
+  label_smoothing: 0.1  # 标签平滑，减少过度自信
+  scheduler_type: 'plateau'  # 调度器类型: 'step' 或 'plateau'
+  scheduler_patience: 5  # ReduceLROnPlateau 耐心值
+  scheduler_factor: 0.2  # ReduceLROnPlateau 衰减因子
 
-# 模型配置（单模态指纹识别）
+# 模型配置（单模态指纹识别 - 人物识别）
 model:
   model_type: 'fingerprint_net'  # 指纹网络类型
   embedding_dim: 256  # 指纹特征嵌入维度
-  num_classes: 600  # 根据您的数据集类别数调整
-  pretrained: false  # 指纹识别通常不需要预训练权重
-  dropout_rate: 0.5
+  num_classes: -1  # 自动检测：-1表示使用数据集实际人物数量
+  pretrained: true  # 使用 ImageNet 预训练权重作为初始化
+  dropout_rate: 0.5  # 降低 dropout 避免欠拟合
 
 # 数据配置
 data:
-  fingerprint_image_size: 224
+  image_size: 224
   use_augmentation: true  # 是否使用数据增强
+  max_persons: 300  # 限制人物数量，用于快速实验
   augmentation:
-    random_horizontal_flip: true
-    random_rotation: 10
-    color_jitter: true
-    random_crop: false
+    random_horizontal_flip: false  # 移除！指纹有左右手区别，翻转会混淆左右手
+    random_rotation: 5              # 减少旋转角度，指纹对旋转敏感
+    color_jitter: false            # 移除！指纹颜色信息不重要，且可能破坏灰度纹理
+    random_crop: false             # 可能破坏指纹完整性
+    random_resized_crop: false     # 可能破坏指纹完整性
+    random_erasing_prob: 0.0       # 移除，可能破坏指纹纹理
+    # 注意：禁用RandomAffine，因为指纹纹理对几何变换敏感
+    random_affine: false
 
 # 路径配置
 paths:
   data_dir: './data'
-  fingerprint_data_dir: './data/fingerprint/fingerprint/organized'  # 指向整理后的指纹数据
+  modality_data_dir: './data/fingerprint/fingerprint/organized'  # 指向整理后的指纹数据
   checkpoint_dir: './checkpoints/fingerprint'  # 指纹模型检查点目录
   log_dir: './logs/fingerprint'  # 指纹识别日志目录
   config_dir: './configs'
@@ -46,6 +60,8 @@ misc:
   log_freq: 10  # 每10个batch记录一次日志
   use_amp: true  # 使用混合精度训练加速
   experiment_name: 'fingerprint_recognition_baseline'  # 实验名称
+  early_stopping: true
+  early_stopping_patience: 10
 
 # 实验配置（用于消融实验）
 experiment:

@@ -6,6 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 import json
 from datetime import datetime
+import subprocess
 
 # Add project root to path for imports
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -234,6 +235,15 @@ def main():
 
     print(f"\nEvaluation summary saved to: {summary_path}")
     print("Evaluation completed!")
+    # 尝试触发训练可视化（若存在训练历史），包含序号
+    try:
+        history_dir = os.path.join(save_dir, args.model_type, args.experiment_name)
+        output_dir = os.path.join(save_dir, "visualization_results")
+        vis_script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "visualize.py")
+        subprocess.run([sys.executable, vis_script, "--experiment_dir", history_dir, "--output_dir", output_dir, "--include_run_seq"], check=False)
+        print(f"Triggered visualization for {history_dir} -> {output_dir}")
+    except Exception as e:
+        print(f"Failed to trigger visualization: {e}")
 
 
 if __name__ == "__main__":

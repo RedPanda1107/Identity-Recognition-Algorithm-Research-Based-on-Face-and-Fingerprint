@@ -1,7 +1,7 @@
 # 模型模块初始化文件
 from .face_net import FaceNet, FaceNetWithArcFace, create_face_model
 from .fingerprint_net import FingerprintNet, create_fingerprint_model
-from .fusion_model import FusionModel, create_fusion_model
+from .fusion_model import FusionModel, EnhancedFusionModel, create_fusion_model, create_enhanced_fusion_model
 
 
 def create_model(modality: str = "face", **kwargs):
@@ -11,7 +11,7 @@ def create_model(modality: str = "face", **kwargs):
     elif modality.lower() == "fingerprint":
         return create_fingerprint_model(**kwargs)
     elif modality.lower() == "fusion":
-        return create_fusion_model(**kwargs)
+        return create_enhanced_fusion_model(**kwargs)
     else:
         raise ValueError(f"Unknown modality: {modality}")
 
@@ -23,6 +23,8 @@ __all__ = [
     "FingerprintNet",
     "create_fingerprint_model",
     "FusionModel",
+    "EnhancedFusionModel",
     "create_fusion_model",
+    "create_enhanced_fusion_model",
     "create_model",
 ]

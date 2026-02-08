@@ -1,76 +1,96 @@
 import torch
-from .base_trainer import BaseTrainer
+from .base_trainer import BaseTrainer, AverageMeter
 
 
 class FusionTrainer(BaseTrainer):
-    """Trainer for fusion model that handles face + fingerprint modalities.
+    """多模态融合训练器
 
-    Expects face_model and fingerprint_model to be provided for feature extraction.
+    支持人脸+指纹特征提取和融合训练
     """
 
     def __init__(self, fusion_model, face_model, fingerprint_model,
                  train_loader, val_loader, optimizer, scheduler, criterion,
                  device, logger, tb_writer=None):
-        # Initialize with fusion model as main model
+        # 初始化父类
         super(FusionTrainer, self).__init__(
             fusion_model, train_loader, val_loader, optimizer, scheduler,
             criterion, device, logger, tb_writer
         )
 
-        # Store modality-specific models
-        self.face_model = face_model.to(device)
-        self.fingerprint_model = fingerprint_model.to(device)
+        # 存储单模态模型
+        self.face_model = face_model.to(device) if face_model else None
+        self.fingerprint_model = fingerprint_model.to(device) if fingerprint_model else None
 
-        # Set to eval mode for feature extraction
-        self.face_model.eval()
-        self.fingerprint_model.eval()
+        # 设置特征提取器为评估模式
+        if self.face_model:
+            self.face_model.eval()
+        if self.fingerprint_model:
+            self.fingerprint_model.eval()
 
-        # Disable gradients for feature extractors
-        for param in self.face_model.parameters():
-            param.requires_grad = False
-        for param in self.fingerprint_model.parameters():
-            param.requires_grad = False
+        # 冻结特征提取器的参数
+        self._freeze_feature_extractors()
+
+    def _freeze_feature_extractors(self):
+        """冻结特征提取器参数"""
+        if self.face_model:
+            for param in self.face_model.parameters():
+                param.requires_grad = False
+        if self.fingerprint_model:
+            for param in self.fingerprint_model.parameters():
+                param.requires_grad = False
 
     @torch.no_grad()
     def _extract_features(self, face_images, fingerprint_images):
-        """Extract features from both modalities."""
-        # Extract face features
-        face_features = self.face_model.extract_features(face_images)
+        """从两个模态提取特征"""
+        # 提取人脸特征
+        if self.face_model:
+            face_features = self.face_model.extract_features(face_images)
+        else:
+            # 如果没有人脸模型，使用随机特征（用于测试）
+            face_features = torch.randn(face_images.size(0), 512, device=self.device)
 
-        # Extract fingerprint features (placeholder for now)
-        # TODO: Replace with actual fingerprint feature extraction
-        fingerprint_features = self.fingerprint_model.extract_features(fingerprint_images) \
-            if self.fingerprint_model is not None else face_features  # Placeholder
+        # 提取指纹特征
+        if self.fingerprint_model:
+            fingerprint_features = self.fingerprint_model.extract_features(fingerprint_images)
+        else:
+            # 如果没有指纹模型，使用随机特征（用于测试）
+            fingerprint_features = torch.randn(fingerprint_images.size(0), 256, device=self.device)
 
         return face_features, fingerprint_features
 
     def train_epoch(self, epoch):
+        """训练一个epoch"""
         self.model.train()
-        self.face_model.eval()  # Keep feature extractors in eval mode
-        self.fingerprint_model.eval()
+        # 特征提取器保持在评估模式
+        if self.face_model:
+            self.face_model.eval()
+        if self.fingerprint_model:
+            self.fingerprint_model.eval()
 
-        loss_meter = self.__class__.__bases__[0].__dict__['AverageMeter']()
-        acc_meter = self.__class__.__bases__[0].__dict__['AverageMeter']()
+        loss_meter = AverageMeter()
+        acc_meter = AverageMeter()
 
         from tqdm import tqdm
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1} [Fusion Train]", leave=False)
 
         for batch_idx, batch in enumerate(pbar):
-            face_images = batch.get('face_image', batch.get('image')).to(self.device)
-            fingerprint_images = batch.get('fingerprint_image', batch.get('image')).to(self.device)
+            face_images = batch['face_image'].to(self.device)
+            fingerprint_images = batch['fingerprint_image'].to(self.device)
             targets = batch['label'].to(self.device)
 
-            # Extract features from both modalities
+            # 提取两个模态的特征
             face_features, fingerprint_features = self._extract_features(face_images, fingerprint_images)
 
-            # Forward through fusion model
+            # 前向传播通过融合模型
             outputs = self.model(face_features, fingerprint_features)
             loss = self.criterion(outputs, targets)
 
+            # 反向传播
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
 
+            # 计算准确率
             preds = outputs.argmax(dim=1)
             acc = (preds == targets).float().mean().item()
 
@@ -83,12 +103,15 @@ class FusionTrainer(BaseTrainer):
 
     @torch.no_grad()
     def validate_epoch(self, epoch):
+        """验证一个epoch"""
         self.model.eval()
-        self.face_model.eval()
-        self.fingerprint_model.eval()
+        if self.face_model:
+            self.face_model.eval()
+        if self.fingerprint_model:
+            self.fingerprint_model.eval()
 
-        loss_meter = self.__class__.__bases__[0].__dict__['AverageMeter']()
-        acc_meter = self.__class__.__bases__[0].__dict__['AverageMeter']()
+        loss_meter = AverageMeter()
+        acc_meter = AverageMeter()
 
         from tqdm import tqdm
         pbar = tqdm(self.val_loader, desc=f"Epoch {epoch+1} [Fusion Val]", leave=False)
@@ -97,17 +120,18 @@ class FusionTrainer(BaseTrainer):
         all_labels = []
 
         for batch in pbar:
-            face_images = batch.get('face_image', batch.get('image')).to(self.device)
-            fingerprint_images = batch.get('fingerprint_image', batch.get('image')).to(self.device)
+            face_images = batch['face_image'].to(self.device)
+            fingerprint_images = batch['fingerprint_image'].to(self.device)
             targets = batch['label'].to(self.device)
 
-            # Extract features from both modalities
+            # 提取特征
             face_features, fingerprint_features = self._extract_features(face_images, fingerprint_images)
 
-            # Forward through fusion model
+            # 前向传播
             outputs = self.model(face_features, fingerprint_features)
             loss = self.criterion(outputs, targets)
 
+            # 计算准确率
             preds = outputs.argmax(dim=1)
             acc = (preds == targets).float().mean().item()
 
@@ -119,7 +143,7 @@ class FusionTrainer(BaseTrainer):
 
             pbar.set_postfix({"loss": f"{loss_meter.avg:.4f}", "acc": f"{acc_meter.avg:.4f}"})
 
-        # Calculate metrics
+        # 计算详细指标
         try:
             from sklearn.metrics import precision_score, recall_score, f1_score
             precision = precision_score(all_labels, all_preds, average='macro', zero_division=0)
@@ -130,3 +154,30 @@ class FusionTrainer(BaseTrainer):
 
         metrics = {"precision": precision, "recall": recall, "f1_score": f1}
         return loss_meter.avg, acc_meter.avg, metrics
+
+    def save_checkpoint(self, path, extra=None):
+        """保存检查点，包含所有模型"""
+        checkpoint = {
+            'fusion_model': self.model.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'scheduler': self.scheduler.state_dict() if self.scheduler else None,
+        }
+
+        if extra:
+            checkpoint.update(extra)
+
+        torch.save(checkpoint, path)
+        self.logger.info(f"保存融合模型检查点: {path}")
+
+    def load_checkpoint(self, path):
+        """加载检查点"""
+        checkpoint = torch.load(path, map_location=self.device)
+
+        self.model.load_state_dict(checkpoint['fusion_model'])
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+
+        if self.scheduler and checkpoint.get('scheduler'):
+            self.scheduler.load_state_dict(checkpoint['scheduler'])
+
+        self.logger.info(f"加载融合模型检查点: {path}")
+        return checkpoint

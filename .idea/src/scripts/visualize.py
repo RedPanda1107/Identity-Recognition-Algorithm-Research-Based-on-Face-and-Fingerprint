@@ -28,8 +28,12 @@ def parse_args():
                        help="Modalities to visualize")
     parser.add_argument("--experiment_pattern", type=str, default="*",
                        help="Pattern to match experiment names (supports wildcards)")
+    parser.add_argument("--experiment_dir", type=str, default=None,
+                       help="Path to a single experiment directory to process (optional)")
     parser.add_argument("--output_dir", type=str, default="./visualization_results",
                        help="Output directory for generated plots")
+    parser.add_argument("--include_run_seq", action="store_true",
+                       help="Include incremental run sequence number in generated filenames")
     parser.add_argument("--generate_comparison", action="store_true",
                        help="Generate comparison plots across modalities")
     return parser.parse_args()
@@ -138,7 +142,20 @@ def plot_biometric_evolution(epochs, eers, aucs, save_path=None):
         plt.show()
 
 
-def generate_experiment_plots(experiment_dir, experiment_name, modality, output_dir):
+def compute_next_run_index(exp_output_dir):
+    """Compute next run index (a + b style) based on existing generated training curve files"""
+    try:
+        if not os.path.exists(exp_output_dir):
+            return 1
+        files = os.listdir(exp_output_dir)
+        # Count existing training curve files (any previous runs)
+        count = sum(1 for f in files if f.startswith("training_curves"))
+        return count + 1
+    except Exception:
+        return 1
+
+
+def generate_experiment_plots(experiment_dir, experiment_name, modality, output_dir, include_run_seq=False):
     """Generate plots for a single experiment"""
     print(f"Processing experiment: {experiment_name} ({modality})")
 
@@ -160,8 +177,16 @@ def generate_experiment_plots(experiment_dir, experiment_name, modality, output_
     # Generate timestamp
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
+    # Compute run index if requested (a+b style)
+    run_index = None
+    if include_run_seq:
+        run_index = compute_next_run_index(exp_output_dir)
+
     # Plot training curves
-    training_curve_path = os.path.join(exp_output_dir, f"training_curves_{timestamp}.png")
+    if run_index is not None:
+        training_curve_path = os.path.join(exp_output_dir, f"training_curves_run_{run_index:03d}_{timestamp}.png")
+    else:
+        training_curve_path = os.path.join(exp_output_dir, f"training_curves_{timestamp}.png")
     plot_training_curves(
         curves_data["train_losses"],
         curves_data["val_losses"],
@@ -171,7 +196,10 @@ def generate_experiment_plots(experiment_dir, experiment_name, modality, output_
     )
 
     # Plot learning rate curve
-    lr_curve_path = os.path.join(exp_output_dir, f"learning_rate_{timestamp}.png")
+    if run_index is not None:
+        lr_curve_path = os.path.join(exp_output_dir, f"learning_rate_run_{run_index:03d}_{timestamp}.png")
+    else:
+        lr_curve_path = os.path.join(exp_output_dir, f"learning_rate_{timestamp}.png")
     plot_learning_rate_curve(
         curves_data["epochs"],
         curves_data["learning_rates"],
@@ -180,7 +208,10 @@ def generate_experiment_plots(experiment_dir, experiment_name, modality, output_
 
     # Plot biometric evolution if data available
     if any(curves_data["biometric_eers"]) and any(curves_data["biometric_aucs"]):
-        biometric_evolution_path = os.path.join(exp_output_dir, f"biometric_evolution_{timestamp}.png")
+        if run_index is not None:
+            biometric_evolution_path = os.path.join(exp_output_dir, f"biometric_evolution_run_{run_index:03d}_{timestamp}.png")
+        else:
+            biometric_evolution_path = os.path.join(exp_output_dir, f"biometric_evolution_{timestamp}.png")
         plot_biometric_evolution(
             curves_data["epochs"],
             curves_data["biometric_eers"],
@@ -197,15 +228,24 @@ def generate_experiment_plots(experiment_dir, experiment_name, modality, output_
         biometric_results = load_biometric_results(biometric_dir, best_epoch)
         if biometric_results:
             # Plot ROC curves
-            roc_path = os.path.join(exp_output_dir, f"roc_curves_epoch_{best_epoch}_{timestamp}.png")
+            if run_index is not None:
+                roc_path = os.path.join(exp_output_dir, f"roc_curves_epoch_{best_epoch}_run_{run_index:03d}_{timestamp}.png")
+            else:
+                roc_path = os.path.join(exp_output_dir, f"roc_curves_epoch_{best_epoch}_{timestamp}.png")
             plot_roc_curves(biometric_results, save_path=roc_path)
 
             # Plot DET curves
-            det_path = os.path.join(exp_output_dir, f"det_curves_epoch_{best_epoch}_{timestamp}.png")
+            if run_index is not None:
+                det_path = os.path.join(exp_output_dir, f"det_curves_epoch_{best_epoch}_run_{run_index:03d}_{timestamp}.png")
+            else:
+                det_path = os.path.join(exp_output_dir, f"det_curves_epoch_{best_epoch}_{timestamp}.png")
             plot_det_curves(biometric_results, save_path=det_path)
 
             # Plot FAR/FRR curves
-            far_frr_path = os.path.join(exp_output_dir, f"far_frr_curves_epoch_{best_epoch}_{timestamp}.png")
+            if run_index is not None:
+                far_frr_path = os.path.join(exp_output_dir, f"far_frr_curves_epoch_{best_epoch}_run_{run_index:03d}_{timestamp}.png")
+            else:
+                far_frr_path = os.path.join(exp_output_dir, f"far_frr_curves_epoch_{best_epoch}_{timestamp}.png")
             plot_far_frr_curves(biometric_results, save_path=far_frr_path)
 
     print(f"Plots saved to: {exp_output_dir}")

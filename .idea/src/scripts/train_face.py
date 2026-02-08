@@ -17,6 +17,7 @@ import torch.nn as nn
 import torch.optim as optim
 import json
 from datetime import datetime
+import subprocess
 
 
 def parse_args():
@@ -38,20 +39,42 @@ def main():
 
     # Use experiment name from config if available, otherwise use command line argument
     experiment_name = config.get("misc", {}).get("experiment_name", args.experiment_name)
-    logger = setup_logger(experiment_name=experiment_name, log_dir=config["paths"].get("log_dir", "./logs"), level="INFO", logger_name="FaceRecognition")
+    # Normalize log_dir and checkpoint_dir to be under scripts/ to avoid multiple copies
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(script_dir)
+    default_log_dir = os.path.join(script_dir, "logs")
+    default_ckpt_dir = os.path.join(script_dir, "checkpoints")
+
+    log_dir = config["paths"].get("log_dir", default_log_dir)
+    if not os.path.isabs(log_dir):
+        log_dir = os.path.join(script_dir, log_dir.lstrip('./'))
+
+    ckpt_dir = config["paths"].get("checkpoint_dir", default_ckpt_dir)
+    if not os.path.isabs(ckpt_dir):
+        ckpt_dir = os.path.join(script_dir, ckpt_dir.lstrip('./'))
+
+    # Write resolved absolute paths back into config so later code uses them
+    config["paths"]["log_dir"] = log_dir
+    config["paths"]["checkpoint_dir"] = ckpt_dir
+
+    logger = setup_logger(experiment_name=experiment_name, log_dir=log_dir, level="INFO", logger_name="FaceRecognition")
 
     set_seed(config.get("misc", {}).get("seed", 42))
     device = get_device(args.device)
     logger.info(f"Using device: {device}")
 
     # Convert relative path to absolute path relative to project root
-    face_data_dir = config["paths"]["face_data_dir"]
-    if not os.path.isabs(face_data_dir):
+    data_dir = config["paths"]["modality_data_dir"]
+    if not os.path.isabs(data_dir):
         # If relative path, make it relative to project root
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        face_data_dir = os.path.join(project_root, face_data_dir.lstrip('./'))
-    train_dataset = FaceDataset(face_data_dir, mode="train", image_size=config["data"]["face_image_size"])
-    val_dataset = FaceDataset(face_data_dir, mode="val", image_size=config["data"]["face_image_size"])
+        data_dir = os.path.join(project_root, data_dir.lstrip('./'))
+    # Pass augmentation params from config to dataset so advanced aug like RandomResizedCrop/RandomErasing can be used
+    aug_params = config["data"].get("augmentation", {}) or {}
+    train_dataset = FaceDataset(data_dir, mode="train", image_size=config["data"]["image_size"], augment=config["data"].get("use_augmentation", True))
+    # attach augmentation params if available
+    train_dataset.augmentation_params = aug_params
+    val_dataset = FaceDataset(data_dir, mode="val", image_size=config["data"]["image_size"], augment=False)
 
     train_loader = DataLoader(train_dataset, batch_size=config["training"]["batch_size"], shuffle=True, num_workers=config["misc"].get("num_workers", 0))
     val_loader = DataLoader(val_dataset, batch_size=config["training"]["batch_size"], shuffle=False, num_workers=config["misc"].get("num_workers", 0))
@@ -59,19 +82,52 @@ def main():
     model = create_model("face",
                          model_type=config["model"].get("model_type", "facenet"),
                          num_classes=len(train_dataset.class_to_idx),
-                         embedding_dim=config["model"].get("face_embedding_dim", 512),
+                         embedding_dim=config["model"].get("embedding_dim", 512),
                          pretrained=config["model"].get("pretrained", True),
-                         dropout_rate=config["model"].get("dropout_rate", 0.5))
+                         dropout_rate=config["model"].get("dropout_rate", 0.5),
+                         spatial_attention=config["model"].get("spatial_attention", True))
 
     total_params, trainable_params = count_parameters(model)
     logger.info(f"Model params: total={total_params:,}, trainable={trainable_params:,}")
+    logger.info(f"Model type: {config['model'].get('model_type', 'facenet')}")
+    logger.info(f"Spatial Attention: {config['model'].get('spatial_attention', True)}")
 
     model = model.to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(model.parameters(), lr=float(config["training"]["learning_rate"]), momentum=float(config["training"]["momentum"]), weight_decay=float(config["training"]["weight_decay"]))
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=int(config["training"].get("scheduler_step", 10)), gamma=float(config["training"].get("scheduler_gamma", 0.1)))
 
-    trainer = FaceTrainer(model, train_loader, val_loader, optimizer, scheduler, criterion, device, logger, tb_writer=None)
+    # Use enhanced FaceTrainer with built-in ArcFace support (same API as FingerprintTrainer)
+    arc_s = float(config["model"].get("arc_s", 30.0))
+    arc_m = float(config["model"].get("arc_m", 0.5))
+
+    optimizer_name = config["training"].get("optimizer", "adam").lower()
+    base_lr = float(config["training"].get("learning_rate", 1e-4))
+    weight_decay = float(config["training"].get("weight_decay", 5e-4))
+
+    # Optimizer
+    if optimizer_name == "adam":
+        optimizer = optim.Adam(model.parameters(), lr=base_lr, weight_decay=weight_decay)
+    else:
+        momentum = float(config["training"].get("momentum", 0.9))
+        optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=momentum, weight_decay=weight_decay)
+
+    # Learning rate scheduler
+    scheduler_type = config["training"].get("scheduler_type", "step")
+    if scheduler_type == "plateau":
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', patience=5, factor=0.2, verbose=True
+        )
+    else:
+        scheduler = optim.lr_scheduler.StepLR(
+            optimizer, step_size=int(config["training"].get("scheduler_step", 10)),
+            gamma=float(config["training"].get("scheduler_gamma", 0.1))
+        )
+
+    # Create FaceTrainer with ArcFace (same API as FingerprintTrainer)
+    trainer = FaceTrainer(
+        model, train_loader, val_loader, optimizer, scheduler,
+        criterion, device, logger, tb_writer=None,
+        arcface_s=arc_s, arcface_m=arc_m
+    )
 
     # 初始化训练历史记录
     training_history = {
@@ -87,24 +143,33 @@ def main():
 
     start_epoch = 0
     best_acc = 0.0
+    no_improve_epochs = 0
+    early_stopping = config.get("misc", {}).get("early_stopping", False)
+    early_stopping_patience = int(config.get("misc", {}).get("early_stopping_patience", 5))
     epochs = int(config["training"]["epochs"])
+    warmup_epochs = int(config["training"].get("warmup_epochs", 0))
+    initial_lr = float(config["training"]["learning_rate"])
+
+    # Training loop with optional warmup (now supported by FaceTrainer)
     for epoch in range(start_epoch, epochs):
         logger.info(f"Epoch {epoch+1}/{epochs}")
+
+        # Warmup: gradually increase learning rate
+        if warmup_epochs > 0 and epoch < warmup_epochs:
+            warmup_factor = (epoch + 1) / warmup_epochs
+            current_lr = initial_lr * 0.1 + (initial_lr - initial_lr * 0.1) * warmup_factor
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = current_lr
+            logger.info(f"Warmup epoch {epoch+1}/{warmup_epochs}, LR: {current_lr:.6f}")
+
         train_loss, train_acc = trainer.train_epoch(epoch)
         val_loss, val_acc, val_metrics = trainer.validate_epoch(epoch)
 
-        # 计算生物识别指标
-        biometric_results = None
-        if "probabilities" in val_metrics and "labels" in val_metrics:
-            biometric_results = calculate_biometric_metrics(
-                val_metrics["labels"],
-                val_metrics["probabilities"],
-                num_classes=num_classes
-            )
-
-        scheduler.step()
-        logger.info(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
-        logger.info(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+        # Step scheduler
+        if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+            scheduler.step(val_loss)
+        else:
+            scheduler.step()
 
         # 记录当前epoch的历史数据
         epoch_data = {
@@ -140,6 +205,15 @@ def main():
             ckpt_path = os.path.join(ckpt_dir, "face", f"best_epoch_{epoch+1}.pth")
             trainer.save_checkpoint(ckpt_path, extra={"epoch": epoch + 1, "val_acc": val_acc})
             logger.info(f"Saved best checkpoint: {ckpt_path}")
+            # reset early stopping counter when improvement observed
+            no_improve_epochs = 0
+        else:
+            no_improve_epochs += 1
+
+        # Early stopping check
+        if early_stopping and no_improve_epochs >= early_stopping_patience:
+            logger.info(f"No improvement for {no_improve_epochs} epochs (patience={early_stopping_patience}). Early stopping triggered.")
+            break
 
     # 保存完整的训练历史
     history_dir = os.path.join(config["paths"].get("log_dir", "./logs"), experiment_name)
@@ -150,6 +224,14 @@ def main():
 
     logger.info(f"Training completed. Best validation accuracy: {best_acc:.4f}")
     logger.info(f"Training history saved to: {history_path}")
+    # 自动触发可视化（包含序号），非阻塞
+    try:
+        output_dir = config["paths"].get("visualization_dir", "./visualization_results")
+        vis_script = os.path.join(project_root, "scripts", "visualize.py")
+        subprocess.run([sys.executable, vis_script, "--experiment_dir", history_dir, "--output_dir", output_dir, "--include_run_seq"], check=False)
+        logger.info(f"Triggered visualization for {experiment_name} -> {output_dir}")
+    except Exception as e:
+        logger.warning(f"Failed to trigger visualization: {e}")
 
 
 if __name__ == "__main__":

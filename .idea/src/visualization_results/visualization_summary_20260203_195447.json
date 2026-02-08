@@ -1,0 +1,15 @@
+{
+  "generation_time": "2026-02-03 19:54:47",
+  "logs_directory": "./logs",
+  "output_directory": "./visualization_results",
+  "modalities_processed": [
+    "face",
+    "fingerprint",
+    "fusion"
+  ],
+  "experiments_processed": {
+    "face": [],
+    "fingerprint": [],
+    "fusion": []
+  }
+}
