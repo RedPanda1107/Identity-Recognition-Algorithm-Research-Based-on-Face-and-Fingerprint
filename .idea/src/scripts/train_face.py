@@ -165,6 +165,15 @@ def main():
         train_loss, train_acc = trainer.train_epoch(epoch)
         val_loss, val_acc, val_metrics = trainer.validate_epoch(epoch)
 
+        # 计算生物识别指标（如果验证返回了概率）
+        biometric_results = None
+        if "probabilities" in val_metrics and "labels" in val_metrics:
+            biometric_results = calculate_biometric_metrics(
+                val_metrics["labels"],
+                val_metrics["probabilities"],
+                num_classes=num_classes
+            )
+
         # Step scheduler
         if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
             scheduler.step(val_loss)
@@ -203,8 +212,8 @@ def main():
             ckpt_dir = config["paths"].get("checkpoint_dir", "./checkpoints")
             os.makedirs(ckpt_dir, exist_ok=True)
             ckpt_path = os.path.join(ckpt_dir, "face", f"best_epoch_{epoch+1}.pth")
-            trainer.save_checkpoint(ckpt_path, extra={"epoch": epoch + 1, "val_acc": val_acc})
-            logger.info(f"Saved best checkpoint: {ckpt_path}")
+            trainer.save_checkpoint(ckpt_path, is_best=True, extra={"epoch": epoch + 1, "val_acc": val_acc})
+            logger.info(f"[保存] 最佳模型: {ckpt_path} (Acc={val_acc:.4f})")
             # reset early stopping counter when improvement observed
             no_improve_epochs = 0
         else:
@@ -212,7 +221,7 @@ def main():
 
         # Early stopping check
         if early_stopping and no_improve_epochs >= early_stopping_patience:
-            logger.info(f"No improvement for {no_improve_epochs} epochs (patience={early_stopping_patience}). Early stopping triggered.")
+            logger.info(f"连续{no_improve_epochs}轮无提升 (patience={early_stopping_patience})，触发早停")
             break
 
     # 保存完整的训练历史
@@ -222,7 +231,7 @@ def main():
     with open(history_path, 'w', encoding='utf-8') as f:
         json.dump(training_history, f, indent=2, ensure_ascii=False, default=str)
 
-    logger.info(f"Training completed. Best validation accuracy: {best_acc:.4f}")
+    logger.info(f"训练完成! 最佳验证准确率: {best_acc:.4f}")
     logger.info(f"Training history saved to: {history_path}")
     # 自动触发可视化（包含序号），非阻塞
     try:

@@ -38,7 +38,7 @@ class FingerprintTrainer(BaseTrainer):
                 m=self.arcface_m
             ).to(self.device)
         
-        self.logger.info(f"[FingerprintTrainer] ArcFace: s={self.arcface_s}, m={self.arcface_m}, classes={num_classes}")
+        self.logger.info(f"[初始化] ArcFace: s={self.arcface_s}, m={self.arcface_m}, 类别数={num_classes}")
 
     def train_step(self, batch):
         """Single training step with ArcFace loss."""
@@ -91,7 +91,7 @@ class FingerprintTrainer(BaseTrainer):
             
             pbar.set_postfix({"loss": f"{loss_meter.avg:.4f}", "acc": f"{acc_meter.avg:.4f}"})
         
-        self.logger.info(f"[Train] Epoch {epoch+1}: Loss={loss_meter.avg:.4f}, Acc={acc_meter.avg:.4f}, FeatNorm={feat_norm_meter.avg:.4f}")
+        self.logger.info(f"[训练] Epoch {epoch+1}: Loss={loss_meter.avg:.4f}, 准确率={acc_meter.avg:.4f}, 特征范数={feat_norm_meter.avg:.4f}")
         
         if self.tb_writer:
             self.tb_writer.add_scalar('train/loss', loss_meter.avg, epoch)
@@ -157,8 +157,7 @@ class FingerprintTrainer(BaseTrainer):
             "feature_norm": feat_norm_meter.avg
         }
         
-        self.logger.info(f"[Val] Epoch {epoch+1}: Loss={loss_meter.avg:.4f}, Top1={top1_acc_meter.avg:.4f}, "
-                        f"P={precision:.4f}, R={recall:.4f}, F1={f1:.4f}")
+        self.logger.info(f"[验证] Epoch {epoch+1}: Loss={loss_meter.avg:.4f}, 准确率={top1_acc_meter.avg:.4f}, 精确率={precision:.4f}, 召回率={recall:.4f}, F1={f1:.4f}")
         
         if self.tb_writer:
             self.tb_writer.add_scalar('val/loss', loss_meter.avg, epoch)
@@ -168,9 +167,9 @@ class FingerprintTrainer(BaseTrainer):
         return loss_meter.avg, top1_acc_meter.avg, metrics
 
     def save_checkpoint(self, path, epoch=None, is_best=False, extra=None):
-        """Save checkpoint with ArcFace state."""
+        """保存检查点（仅最佳模型）"""
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        
+
         state = {
             "model_state": self.model.state_dict(),
             "optimizer_state": self.optimizer.state_dict(),
@@ -179,12 +178,14 @@ class FingerprintTrainer(BaseTrainer):
         }
         if extra:
             state.update(extra)
-        
-        torch.save(state, path)
-        
+
+        # 只保存最佳模型
         if is_best:
-            best_path = path.replace(".pth", "_best.pth")
-            torch.save(state, best_path)
-            self.logger.info(f"[Checkpoint] Best: {best_path}")
-        
+            torch.save(state, path)
+            self.logger.info(f"[保存] 最佳模型: {path}")
+        else:
+            # 临时保存Latest用于恢复训练
+            latest_path = path.replace(".pth", "_latest.pth")
+            torch.save(state, latest_path)
+
         return path

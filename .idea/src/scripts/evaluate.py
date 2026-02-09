@@ -41,21 +41,19 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_model_and_config(model_type, checkpoint_path, device):
+def load_model_and_config(model_type, checkpoint_path, device, config_path=None):
     """Load model and configuration from checkpoint"""
     # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     # Try to infer config path from model type
-    if not os.path.exists(args.config if hasattr(args, 'config') and args.config else ""):
+    if not config_path or not os.path.exists(config_path):
         config_paths = {
             "face": "configs/face_config.yaml",
             "fingerprint": "configs/fingerprint_config.yaml",
             "fusion": "configs/fusion_config.yaml"
         }
         config_path = config_paths.get(model_type, "configs/face_config.yaml")
-    else:
-        config_path = args.config
 
     config = load_config(config_path)
 
@@ -65,25 +63,29 @@ def load_model_and_config(model_type, checkpoint_path, device):
         face_checkpoint = config.get("paths", {}).get("face_checkpoint", "")
         fingerprint_checkpoint = config.get("paths", {}).get("fingerprint_checkpoint", "")
 
-        if not face_checkpoint or not fingerprint_checkpoint:
-            raise ValueError("Fusion model requires face_checkpoint and fingerprint_checkpoint in config")
-
         face_model = create_model("face",
                                 model_type=config["model"].get("face_model_type", "facenet"),
                                 num_classes=config["model"].get("num_classes", 200),
-                                embedding_dim=config["model"].get("face_embedding_dim", 512))
+                                embedding_dim=config["model"].get("face_embedding_dim", 512),
+                                pretrained=False)
         fingerprint_model = create_model("fingerprint",
-                                       model_type=config["model"].get("fingerprint_model_type", "resnet"),
-                                       num_classes=config["model"].get("num_classes", 600),
-                                       embedding_dim=config["model"].get("fingerprint_embedding_dim", 512))
+                                       model_type=config["model"].get("fingerprint_model_type", "fingerprint_net"),
+                                       embedding_dim=config["model"].get("fingerprint_embedding_dim", 256),
+                                       pretrained=False)
 
-        face_model.load_state_dict(torch.load(face_checkpoint, map_location=device)["model_state"])
-        fingerprint_model.load_state_dict(torch.load(fingerprint_checkpoint, map_location=device)["model_state"])
+        # 加载预训练权重
+        if face_checkpoint and os.path.exists(face_checkpoint):
+            face_model.load_state_dict(torch.load(face_checkpoint, map_location=device)["model_state"])
+        if fingerprint_checkpoint and os.path.exists(fingerprint_checkpoint):
+            fingerprint_model.load_state_dict(torch.load(fingerprint_checkpoint, map_location=device)["model_state"])
 
         model = create_model("fusion",
-                           face_model=face_model,
-                           fingerprint_model=fingerprint_model,
-                           num_classes=config["model"].get("num_classes", 200))
+                           face_embedding_dim=config["model"].get("face_embedding_dim", 512),
+                           fingerprint_embedding_dim=config["model"].get("fingerprint_embedding_dim", 256),
+                           num_classes=config["model"].get("num_classes", 200),
+                           hidden_dim=config["model"].get("fusion_hidden_dim", 512),
+                           dropout_rate=config["model"].get("fusion_dropout_rate", 0.3),
+                           fusion_method=config["model"].get("fusion_method", "concat"))
     else:
         model = create_model(model_type,
                            model_type=config["model"].get("model_type", "facenet"),
@@ -175,7 +177,7 @@ def main():
     print(f"Evaluating {args.model_type} model: {args.checkpoint_path}")
 
     # Load model and config
-    model, config = load_model_and_config(args.model_type, args.checkpoint_path, device)
+    model, config = load_model_and_config(args.model_type, args.checkpoint_path, device, args.config)
 
     # Create dataset
     data_dir = config["paths"]["data_dir"]

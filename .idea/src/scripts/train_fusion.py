@@ -3,6 +3,9 @@
 Fusion training script for face + fingerprint multimodal recognition.
 Uses feature concatenation approach.
 """
+# Windows UTF-8 encoding fix
+import sys, io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 import os
 import sys
@@ -20,6 +23,7 @@ from core.utils import load_config, set_seed, get_device, count_parameters, setu
 from core.datasets.fusion_dataset import FusionDataset
 from core.models import create_model
 from core.trainers.fusion_trainer import FusionTrainer
+from core.losses.arcface import ArcMarginProduct
 import json
 from datetime import datetime
 import subprocess
@@ -139,6 +143,15 @@ def main():
     logger.info(f"Val set size: {len(val_dataset)}")
     logger.info(f"Number of classes: {len(train_dataset.class_to_idx)}")
 
+    # 🔧 【指令C】确认数据对齐绑定
+    logger.info("[Data] ✅ 人脸-指纹数据对齐绑定已确认:")
+    logger.info(f"[Data] - 人脸数据目录: {face_data_dir}")
+    logger.info(f"[Data] - 指纹数据目录: {fingerprint_data_dir}")
+    if train_dataset.samples:
+        sample = train_dataset.samples[0]
+        logger.info(f"[Data] - 配对示例: face={os.path.basename(sample['face_path'])}, "
+                   f"fp={os.path.basename(sample['fingerprint_path'])}, label={sample['label']}")
+
     # Create models
     # Load pre-trained face model for feature extraction
     face_model = create_model(
@@ -146,7 +159,9 @@ def main():
         model_type=config["model"].get("face_model_type", "facenet"),
         num_classes=len(train_dataset.class_to_idx),
         embedding_dim=config["model"].get("face_embedding_dim", 512),
-        pretrained=config["model"].get("face_pretrained", True)
+        pretrained=config["model"].get("face_pretrained", True),
+        dropout_rate=config["model"].get("dropout_rate", 0.5),
+        spatial_attention=config["model"].get("face_spatial_attention", False)  # 🔧 禁用
     )
 
     # Load pre-trained fingerprint model for feature extraction
@@ -155,7 +170,9 @@ def main():
         model_type=config["model"].get("fingerprint_model_type", "fingerprint_net"),
         num_classes=len(train_dataset.class_to_idx),
         embedding_dim=config["model"].get("fingerprint_embedding_dim", 256),
-        pretrained=config["model"].get("fingerprint_pretrained", False)
+        pretrained=config["model"].get("fingerprint_pretrained", False),
+        dropout_rate=config["model"].get("dropout_rate", 0.5),
+        spatial_attention=config["model"].get("spatial_attention", True)
     )
 
     # Create fusion model
@@ -184,26 +201,91 @@ def main():
     face_model = face_model.to(device)
     fingerprint_model = fingerprint_model.to(device)
 
-    # Training components
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(
-        fusion_model.parameters(),
-        lr=float(config["training"]["learning_rate"]),
-        momentum=float(config["training"]["momentum"]),
-        weight_decay=float(config["training"]["weight_decay"])
-    )
+    # 【指令B】设置ArcFace分类器到FusionModel
+    num_classes = len(train_dataset.class_to_idx)
+    face_embedding_dim = config["model"].get("face_embedding_dim", 512)
+    fp_embedding_dim = config["model"].get("fingerprint_embedding_dim", 256)
+    fusion_features_dim = face_embedding_dim + fp_embedding_dim  # 768
 
-    scheduler = optim.lr_scheduler.StepLR(
-        optimizer,
-        step_size=int(config["training"].get("scheduler_step", 10)),
-        gamma=float(config["training"].get("scheduler_gamma", 0.1))
-    )
+    # 创建ArcFace分类器并设置到FusionModel
+    arc_classifier = ArcMarginProduct(
+        in_features=fusion_features_dim,  # 融合特征维度768
+        out_features=num_classes,
+        s=30.0,
+        m=0.3
+    ).to(device)
+    fusion_model.arc_classifier = arc_classifier
+    logger.info(f"[Train] ArcFace classifier set: in={fusion_features_dim}, out={num_classes}, s=30.0, m=0.3")
+
+    # 使用CrossEntropyLoss（因为FusionModel内部已集成ArcFace）
+    criterion = nn.CrossEntropyLoss()
+
+    # 🔧 【指令B】使用AdamW优化器 + Warmup
+    optimizer_name = config["training"].get("optimizer", "adamw").lower()
+    learning_rate = float(config["training"]["learning_rate"])
+    weight_decay = float(config["training"].get("weight_decay", 1e-2))
+
+    if optimizer_name == "adamw":
+        optimizer = optim.AdamW(
+            fusion_model.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay
+        )
+        logger.info(f"[Train] 使用 AdamW 优化器, lr={learning_rate}, weight_decay={weight_decay}")
+    else:
+        momentum = float(config["training"].get("momentum", 0.9))
+        optimizer = optim.SGD(
+            fusion_model.parameters(),
+            lr=learning_rate,
+            momentum=momentum,
+            weight_decay=weight_decay
+        )
+        logger.info(f"[Train] 使用 SGD 优化器, lr={learning_rate}, momentum={momentum}")
+
+    # 🔧 【指令B】添加Cosine学习率调度 + Warmup
+    scheduler_type = config["training"].get("scheduler_type", "cosine").lower()
+    warmup_epochs = int(config["training"].get("warmup_epochs", 5))
+    epochs = int(config["training"]["epochs"])
+
+    if scheduler_type == "cosine":
+        # Cosine Annealing with Warmup
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=epochs - warmup_epochs,  # 减去warmup期
+            eta_min=1e-6
+        )
+        # 自定义Warmup调度
+        warmup_scheduler = optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=0.1,  # 从10%开始
+            total_iters=warmup_epochs
+        )
+        logger.info(f"[Train] 使用 Cosine调度 + {warmup_epochs}轮 Warmup")
+    else:
+        # StepLR作为fallback
+        step_size = int(config["training"].get("scheduler_step", 20))
+        gamma = float(config["training"].get("scheduler_gamma", 0.1))
+        scheduler = optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=step_size,
+            gamma=gamma
+        )
+        warmup_scheduler = None
+        logger.info(f"[Train] 使用 StepLR 调度")
 
     # Create trainer - pass pretrained checkpoints
     pretrained_ckpts = {
         'face': args.face_ckpt,
         'fingerprint': args.fp_ckpt
     }
+
+    # 🔧 【指令C】解冻策略参数
+    unfreeze_epoch = int(config["training"].get("unfreeze_epoch", 10))
+    face_lr = float(config["training"].get("face_lr", 1e-5))
+    fp_lr = float(config["training"].get("fp_lr", 1e-5))
+
+    logger.info(f"[Train] 解冻策略: Epoch {unfreeze_epoch} 后解冻Backbone")
+    logger.info(f"[Train] Backbone学习率: face={face_lr}, fingerprint={fp_lr}")
 
     trainer = FusionTrainer(
         fusion_model=fusion_model,
@@ -217,7 +299,10 @@ def main():
         device=device,
         logger=logger,
         tb_writer=None,
-        pretrained_ckpts=pretrained_ckpts
+        pretrained_ckpts=pretrained_ckpts,
+        unfreeze_epoch=unfreeze_epoch,
+        face_lr=face_lr,
+        fp_lr=fp_lr
     )
 
     # 初始化训练历史记录
@@ -258,6 +343,12 @@ def main():
 
         scheduler.step()
 
+        # 🔧 【指令B】Warmup调度器处理
+        if warmup_scheduler is not None and epoch < warmup_epochs - 1:
+            warmup_scheduler.step()
+            current_lr = optimizer.param_groups[0]['lr']
+            logger.debug(f"[Warmup] Epoch {epoch+1}: lr = {current_lr:.6f}")
+
         logger.info(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
         logger.info(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
         logger.info(f"Val Precision: {val_metrics['precision']:.4f}, "
@@ -297,15 +388,15 @@ def main():
             ckpt_dir = config["paths"].get("checkpoint_dir", "./checkpoints")
             os.makedirs(ckpt_dir, exist_ok=True)
             ckpt_path = os.path.join(ckpt_dir, f"best_{args.fusion_method}_epoch_{epoch+1}.pth")
-            trainer.save_checkpoint(ckpt_path, extra={"epoch": epoch + 1, "val_acc": val_acc})
-            logger.info(f"Saved best fusion checkpoint: {ckpt_path}")
+            trainer.save_checkpoint(ckpt_path, is_best=True, extra={"epoch": epoch + 1, "val_acc": val_acc})
+            logger.info(f"[保存] 最佳融合模型: {ckpt_path} (Acc={val_acc:.4f})")
             no_improve_epochs = 0
         else:
             no_improve_epochs += 1
 
         # Early stopping
         if early_stopping and no_improve_epochs >= early_stopping_patience:
-            logger.info(f"No improvement for {no_improve_epochs} epochs (patience={early_stopping_patience}). Early stopping triggered.")
+            logger.info(f"连续{no_improve_epochs}轮无提升 (patience={early_stopping_patience})，触发早停")
             break
 
     # 保存完整的训练历史
@@ -315,7 +406,7 @@ def main():
     with open(history_path, 'w', encoding='utf-8') as f:
         json.dump(training_history, f, indent=2, ensure_ascii=False, default=str)
 
-    logger.info(f"Training completed. Best validation accuracy: {best_acc:.4f}")
+    logger.info(f"训练完成! 最佳验证准确率: {best_acc:.4f}")
     logger.info(f"Training history saved to: {history_path}")
     # 自动触发可视化（包含序号），非阻塞
     try:

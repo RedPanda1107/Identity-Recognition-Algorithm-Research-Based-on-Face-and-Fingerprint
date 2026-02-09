@@ -5,24 +5,25 @@
 training:
   epochs: 50  # 增加训练轮次以便更充分训练
   batch_size: 32
-  learning_rate: 1e-4  # 改为较小的初始学习率，建议与 Adam 配合使用
+  learning_rate: 5e-4  # ArcFace需要更大的步长来推开特征间距
   weight_decay: 5e-4  # 增强正则化以减少过拟合
   optimizer: 'adam'    # 切换为 Adam 优化器
   scheduler_step: 20  # 每20个epoch衰减学习率
   scheduler_gamma: 0.1
-  warmup_epochs: 1    # 线性 warmup epoch 数
-  freeze_backbone_epochs: 0  # 关闭 backbone 冻结，让整个网络从第1个epoch开始训练
+  warmup_epochs: 5    # 线性 warmup epoch 数，确保学习率平滑爬升
+  freeze_backbone_epochs: 3  # 先训练分类头3轮，避免随机初始化梯度破坏预训练权重
 
 # 模型配置（单模态人脸识别）
 model:
-  model_type: 'facenet_arcface'  # 'facenet' 或 'facenet_arcface'
+  model_type: 'facenet'  # 'facenet' 或 'facenet_arcface'
   embedding_dim: 512
   num_classes: 100  # 根据您的数据集类别数调整
   pretrained: true  # 使用ImageNet预训练权重
-  dropout_rate: 0.6  # 稍微加大dropout以缓解过拟合
-  # ArcFace 参数（可在 config 中调整）
-  arc_s: 30.0
-  arc_m: 0.1
+  dropout_rate: 0.5  # 稍微加大dropout以缓解过拟合
+  spatial_attention: false  # 人脸暂时禁用spatial attention，排除干扰
+  # ArcFace 参数（软着陆：减小起步时的惩罚力度）
+  arc_s: 20.0
+  arc_m: 0.2
 
 # 数据配置
 data:
@@ -54,7 +55,7 @@ misc:
   use_amp: true  # 使用混合精度训练加速
   experiment_name: 'face_recognition_baseline'  # 实验名称
   early_stopping: true
-  early_stopping_patience: 5
+  early_stopping_patience: 20  # 给ArcFace足够的收敛窗口
 
 # 实验配置（用于消融实验）
 experiment:

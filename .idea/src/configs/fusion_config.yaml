@@ -1,15 +1,21 @@
 # 多模态人脸+指纹融合识别配置文件
 # 专为毕业论文多模态融合实验设计 (300人版本)
 
+# 🔧 【指令B】【指令C】优化训练配置
 # 训练配置
 training:
   epochs: 50
   batch_size: 32
-  learning_rate: 0.001  # 融合模型使用较低的学习率
-  weight_decay: 5e-4
-  momentum: 0.9
-  scheduler_step: 20
-  scheduler_gamma: 0.1
+  learning_rate: 1e-4  # 融合层学习率
+  weight_decay: 1e-2    # AdamW需要适当增加权重衰减
+  optimizer: 'adamw'    # AdamW优化器
+  warmup_epochs: 5      # Warmup轮次
+  scheduler_type: 'cosine'  # Cosine学习率调度
+
+  # 🔧 【指令C】解冻策略
+  unfreeze_epoch: 10     # 前10轮冻结Backbone，第10轮后解冻
+  face_lr: 1e-5         # 解冻后人脸模型的学习率
+  fp_lr: 1e-5           # 解冻后指纹模型的学习率
 
 # 模型配置（多模态融合）
 model:
@@ -17,6 +23,7 @@ model:
   face_model_type: 'facenet'
   face_embedding_dim: 512
   face_pretrained: true  # 加载预训练权重
+  face_spatial_attention: false  # 🔧 禁用空间注意力（与face_config.yaml一致）
 
   # 指纹分支配置
   fingerprint_model_type: 'fingerprint_net'

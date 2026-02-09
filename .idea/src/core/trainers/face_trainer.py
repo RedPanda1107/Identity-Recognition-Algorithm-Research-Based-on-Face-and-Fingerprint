@@ -40,7 +40,7 @@ class FaceTrainer(BaseTrainer):
                 m=self.arcface_m
             ).to(self.device)
             
-            self.logger.info(f"[FaceTrainer] ArcFace: s={self.arcface_s}, m={self.arcface_m}, classes={num_classes}")
+            self.logger.info(f"[初始化] ArcFace: s={self.arcface_s}, m={self.arcface_m}, 类别数={num_classes}")
 
     def train_step(self, batch):
         """Single training step with ArcFace loss."""
@@ -70,10 +70,35 @@ class FaceTrainer(BaseTrainer):
         
         for batch in pbar:
             loss, logits = self.train_step(batch)
-            
+
+            # Extract inputs for feature norm tracking (train_step doesn't return it)
+            inputs = batch.get("image", batch.get("input"))
+            if inputs is None:
+                raise ValueError("Batch must contain 'image' or 'input' key")
+            inputs = inputs.to(self.device)
+
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
+
+            # === 调试监控：检查 logits 分布 ===
+            with torch.no_grad():
+                embeddings = F.normalize(self.model._extract_features(inputs), p=2, dim=1)
+                feat_norm = embeddings.norm(dim=1).mean().item()
+                logits_max = logits.max().item()
+                logits_min = logits.min().item()
+                logits_mean = logits.mean().item()
+
+                # 异常检测警告
+                if logits_max > 100 or logits_min < -100:
+                    self.logger.warning(
+                        f"[调试] Logits异常: max={logits_max:.2f}, min={logits_min:.2f}, "
+                        f"s={self.arcface_s}可能过大!"
+                    )
+                if feat_norm < 0.1 or feat_norm > 2.0:
+                    self.logger.warning(
+                        f"[调试] 特征范数异常: feat_norm={feat_norm:.4f}, 预期约等于1.0"
+                    )
             
             preds = logits.argmax(dim=1)
             acc = (preds == batch["label"].to(self.device)).float().mean().item()
@@ -90,7 +115,7 @@ class FaceTrainer(BaseTrainer):
             
             pbar.set_postfix({"loss": f"{loss_meter.avg:.4f}", "acc": f"{acc_meter.avg:.4f}"})
         
-        self.logger.info(f"[Train] Epoch {epoch+1}: Loss={loss_meter.avg:.4f}, Acc={acc_meter.avg:.4f}, FeatNorm={feat_norm_meter.avg:.4f}")
+            self.logger.info(f"[训练] Epoch {epoch+1}: Loss={loss_meter.avg:.4f}, 准确率={acc_meter.avg:.4f}, 特征范数={feat_norm_meter.avg:.4f}")
         
         if self.tb_writer:
             self.tb_writer.add_scalar('train/loss', loss_meter.avg, epoch)
@@ -156,8 +181,7 @@ class FaceTrainer(BaseTrainer):
             "feature_norm": feat_norm_meter.avg
         }
         
-        self.logger.info(f"[Val] Epoch {epoch+1}: Loss={loss_meter.avg:.4f}, Top1={top1_acc_meter.avg:.4f}, "
-                        f"P={precision:.4f}, R={recall:.4f}, F1={f1:.4f}")
+        self.logger.info(f"[验证] Epoch {epoch+1}: Loss={loss_meter.avg:.4f}, 准确率={top1_acc_meter.avg:.4f}, 精确率={precision:.4f}, 召回率={recall:.4f}, F1={f1:.4f}")
         
         if self.tb_writer:
             self.tb_writer.add_scalar('val/loss', loss_meter.avg, epoch)
@@ -167,10 +191,10 @@ class FaceTrainer(BaseTrainer):
         return loss_meter.avg, top1_acc_meter.avg, metrics
 
     def save_checkpoint(self, path, epoch=None, is_best=False, extra=None):
-        """Save checkpoint with ArcFace state."""
+        """保存检查点（仅最佳模型）"""
         import os
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        
+
         state = {
             "model_state": self.model.state_dict(),
             "optimizer_state": self.optimizer.state_dict(),
@@ -179,12 +203,14 @@ class FaceTrainer(BaseTrainer):
         }
         if extra:
             state.update(extra)
-        
-        torch.save(state, path)
-        
+
+        # 只保存最佳模型
         if is_best:
-            best_path = path.replace(".pth", "_best.pth")
-            torch.save(state, best_path)
-            self.logger.info(f"[Checkpoint] Best: {best_path}")
-        
+            torch.save(state, path)
+            self.logger.info(f"[保存] 最佳模型: {path}")
+        else:
+            # 临时保存Latest用于恢复训练
+            latest_path = path.replace(".pth", "_latest.pth")
+            torch.save(state, latest_path)
+
         return path

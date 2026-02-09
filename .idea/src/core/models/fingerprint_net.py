@@ -4,49 +4,16 @@ import torchvision.models as models
 from torch.nn import functional as F
 
 from ..losses.arcface import ArcMarginProduct
-
-
-class SpatialAttention(nn.Module):
-    """Spatial Attention Module for fingerprint local detail enhancement."""
-
-    def __init__(self, in_channels, reduction_ratio=16):
-        super(SpatialAttention, self).__init__()
-        self.conv1x1 = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels // reduction_ratio, kernel_size=1, bias=False),
-            nn.BatchNorm2d(in_channels // reduction_ratio),
-            nn.ReLU(inplace=True)
-        )
-        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fusion = nn.Sequential(
-            nn.Conv2d(in_channels // reduction_ratio, in_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(in_channels),
-            nn.Sigmoid()
-        )
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-            elif isinstance(module, nn.BatchNorm2d):
-                nn.init.constant_(module.weight, 1)
-                nn.init.constant_(module.bias, 0)
-
-    def forward(self, x):
-        spatial_features = self.conv1x1(x)
-        pooled = self.global_pool(spatial_features)
-        attention = self.fusion(pooled)
-        return x * attention
+from ..modules.attention import SpatialAttention
 
 
 class FingerprintNet(nn.Module):
     """Fingerprint feature extraction network with Spatial Attention and ArcFace support."""
 
-    def __init__(self, num_classes=6000, embedding_dim=256, pretrained=False, 
+    def __init__(self, num_classes=6000, embedding_dim=256, pretrained=False,
                  dropout_rate=0.5, spatial_attention=True):
         super(FingerprintNet, self).__init__()
+
         self.num_classes = num_classes
         self.embedding_dim = embedding_dim
         self.spatial_attention_enabled = spatial_attention
@@ -64,7 +31,7 @@ class FingerprintNet(nn.Module):
         for param in self.backbone.parameters():
             param.requires_grad = True
 
-        # Spatial Attention
+        # Spatial Attention (shared module)
         if self.spatial_attention_enabled:
             self.spatial_attn = SpatialAttention(self.backbone_out_channels, reduction_ratio=16)
 
@@ -91,18 +58,20 @@ class FingerprintNet(nn.Module):
         self._initialize_weights()
 
     def _initialize_weights(self):
+        """初始化模型权重（只初始化新增的层，不影响预训练backbone）"""
         for module in self.modules():
-            if isinstance(module, nn.Linear):
+            # 只初始化新增的层（不在backbone中）
+            if isinstance(module, nn.Linear) and module.in_features not in [512, 256]:
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
-            elif isinstance(module, nn.Conv2d):
+            elif isinstance(module, nn.Conv2d) and module.in_channels not in [3, 64, 128, 256, 512]:
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
             elif isinstance(module, nn.BatchNorm2d):
-                nn.init.constant_(module.weight, 1)
-                nn.init.constant_(module.bias, 0)
+                # BatchNorm权重初始化已被预训练权重覆盖，跳过
+                pass
 
     def _extract_features(self, x):
         """Unified feature extraction pipeline."""
@@ -149,7 +118,7 @@ class FingerprintNet(nn.Module):
                 logits = self._classifier(embeddings, labels) if labels is not None else self._classifier(embeddings)
                 return logits, embeddings
             return self._classifier(embeddings, labels) if labels is not None else self._classifier(embeddings)
-        
+
         # No classifier, return embeddings
         if return_features:
             return embeddings, embeddings
@@ -175,27 +144,12 @@ class FingerprintNet(nn.Module):
 
 
 def create_fingerprint_model(model_type='fingerprint_net', **kwargs):
+    """Factory function: Create fingerprint recognition model."""
     if model_type.lower() == 'fingerprint_net':
         return FingerprintNet(**kwargs)
     raise ValueError(f"Unsupported model type: {model_type}")
 
 
-if __name__ == "__main__":
-    model = FingerprintNet(num_classes=6000, embedding_dim=256)
-    model.classifier = ArcMarginProduct(256, 6000, s=30.0, m=0.50).to(torch.device('cpu'))
-
-    x = torch.randn(4, 3, 224, 224)
-    model.train()
-    labels = torch.tensor([0, 1, 2, 3])
-    logits = model(x, labels=labels)
-    print(f"Input: {x.shape}, Logits: {logits.shape}")
-
-    model.eval()
-    embeddings = model(x)
-    print(f"Embeddings: {embeddings.shape}, Norm: {embeddings.norm(dim=1)}")
-
-    features = model.extract_features(x)
-    print(f"Extracted features: {features.shape}")
-
-    total = sum(p.numel() for p in model.parameters())
-    print(f"Total params: {total:,}")
+def get_fingerprint_embedding_dim():
+    """Get standard fingerprint embedding dimension."""
+    return 256
