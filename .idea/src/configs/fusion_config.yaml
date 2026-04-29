@@ -1,91 +1,50 @@
 # 多模态人脸+指纹融合识别配置文件
-# 专为毕业论文多模态融合实验设计 (300人版本)
+# 特征级融合方案 - 简化版（无ArcFace）
 
-# 🔧 【指令B】【指令C】优化训练配置
-# 训练配置
 training:
   epochs: 50
-  batch_size: 32
-  learning_rate: 1e-4  # 融合层学习率
-  weight_decay: 1e-2    # AdamW需要适当增加权重衰减
-  optimizer: 'adamw'    # AdamW优化器
-  warmup_epochs: 5      # Warmup轮次
-  scheduler_type: 'cosine'  # Cosine学习率调度
+  batch_size: 16  # 减小 batch size 以适应 6GB GPU（同时训练3个ResNet50）
+  accumulation_steps: 2  # 梯度累积步数，实际 batch = 16*2=32
+  learning_rate: 1e-4
+  weight_decay: 1e-4
+  freeze_backbone: false  # 训练backbone
+  label_smoothing: 0.1
+  use_amp: true  # 启用混合精度训练节省显存
 
-  # 🔧 【指令C】解冻策略
-  unfreeze_epoch: 10     # 前10轮冻结Backbone，第10轮后解冻
-  face_lr: 1e-5         # 解冻后人脸模型的学习率
-  fp_lr: 1e-5           # 解冻后指纹模型的学习率
-
-# 模型配置（多模态融合）
 model:
-  # 人脸分支配置
-  face_model_type: 'facenet'
   face_embedding_dim: 512
-  face_pretrained: true  # 加载预训练权重
-  face_spatial_attention: false  # 🔧 禁用空间注意力（与face_config.yaml一致）
-
-  # 指纹分支配置
-  fingerprint_model_type: 'fingerprint_net'
-  fingerprint_embedding_dim: 256
-  fingerprint_pretrained: true  # 加载预训练权重
-
-  # 融合层配置
-  fusion_method: 'concat'  # 'concat', 'attention_fusion', 'cross_attention', 'tensor_fusion'
-  fusion_hidden_dim: 512
+  fingerprint_embedding_dim: 512
+  fusion_dim: 256
   fusion_dropout_rate: 0.3
+  num_classes: 500  # 500 人（000-499，与数据集完全对齐）
+  use_arcface: true            # 启用 ArcFace 度量学习 (学术标准配置)
+  arc_s: 64.0                  # Scale factor
+  arc_m: 0.5                   # Angular margin penalty
 
-  num_classes: 300  # 300人
-
-# 数据配置
 data:
   face_image_size: 224
   fingerprint_image_size: 224
   use_augmentation: true
+  split_ratio: 0.8           # Person-wise 划分：80% 训练 20% 剩余人员
+  test_split_ratio: 0.5     # 剩余人员中 50% 验证 50% 测试 (最终: 70%训练 10%验证 20%测试)
+  gallery_per_person: 3        # 验证/测试集 Gallery 每人的图片数
   augmentation:
     random_horizontal_flip: true
     random_rotation: 10
-    color_jitter: true
-    random_crop: false
-    random_resized_crop: true
-    random_erasing_prob: 0.2
+    color_jitter: false
+    random_erasing_prob: 0.0
 
-# 路径配置
 paths:
-  data_dir: './data'
-  face_data_dir: './data/face/face'
-  fingerprint_data_dir: './data/fingerprint/fingerprint/organized'
-  mapping_file: './data/face_fingerprint_mapping.json'
-  checkpoint_dir: './checkpoints/fusion'
-  log_dir: './logs/fusion'
-  config_dir: './configs'
-  results_dir: './results/fusion'
+  data_dir: 'D:/VSpro/1.0/.idea/src/data'
+  face_data_dir: 'D:/VSpro/1.0/.idea/src/data/face/face'
+  fingerprint_data_dir: 'D:/VSpro/1.0/.idea/src/data/CASIA-FingerprintV5(BMP)'
+  mapping_file: 'D:/VSpro/1.0/.idea/src/data/face_casia_mapping.json'
+  pretrained_face: ''
+  pretrained_fingerprint: ''
 
-# 其他配置
 misc:
   seed: 42
   num_workers: 4
-  save_freq: 5
-  log_freq: 10
-  use_amp: true
-  experiment_name: 'fusion_300persons'  # 300人融合实验
+  save_freq: 10
   early_stopping: true
-  early_stopping_patience: 10
-
-# 实验配置
-experiment:
-  ablation_study: false
-  test_time_augmentation: false
-  save_features: true  # 保存特征向量用于分析
-  evaluate_every_epoch: true
-
-  # 融合特有实验设置
-  modality_ablation: true  # 开启模态消融实验
-  face_only: false
-  fingerprint_only: false
-
-# 调试配置
-debug:
-  debug_mode: false
-  max_samples: null
-  log_images: false
+  early_stopping_patience: 15

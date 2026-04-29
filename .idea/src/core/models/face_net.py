@@ -166,13 +166,13 @@ class FaceNet(nn.Module):
         self._classifier = value
 
     def extract_features(self, x):
-        """Extract L2-normalized feature vectors for inference.
+        """Extract L2-normalized feature vectors.
 
         Compatible with FingerprintNet API for unified feature extraction.
+        Does NOT use no_grad to allow gradient flow during fusion training.
         """
-        with torch.no_grad():
-            features = self._extract_features(x)
-            embeddings = F.normalize(features, p=2, dim=1)
+        features = self._extract_features(x)
+        embeddings = F.normalize(features, p=2, dim=1)
         return embeddings
 
     def get_embedding_dim(self):

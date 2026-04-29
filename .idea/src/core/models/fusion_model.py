@@ -1,383 +1,540 @@
+"""
+多模态特征融合模型
+支持人脸+指纹的特征级融合
+
+提供多种融合策略：
+    1. SimpleFusionModel      - 简化加权融合
+    2. AdaptiveFusionModel    - 注意力自适应融合
+    3. GatedFusionModel       - 门控融合（论文常用）
+    4. HierarchicalFusionModel - 层级融合
+"""
+
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
+import torch.nn.functional as F
 
 
-class EnhancedFusionModel(nn.Module):
-    """增强版多模态融合模型
+class ModalityProjection(nn.Module):
+    """模态投影层 - 将不同模态特征映射到统一子空间"""
 
-    支持多种融合策略：concat, attention_fusion, cross_attention, tensor_fusion
-    支持 ArcFace 损失函数（与单模态训练对齐）
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        self.projection = nn.Sequential(
+            nn.Linear(input_dim, output_dim),
+            nn.LayerNorm(output_dim),
+            nn.GELU(),
+        )
+
+    def forward(self, x):
+        return self.projection(x)
+
+
+class SimpleFusionModel(nn.Module):
+    """简化版多模态特征融合模型
+
+    架构：
+    1. 模态投影 - 统一特征空间
+    2. 加权融合 - 学习模态权重
+    3. 分类器 - ArcFace 度量学习头
+
+    特征维度验证：
+    - face_embedding_dim: 512 (标准)
+    - fingerprint_embedding_dim: 512 (标准)
+    - fusion_dim: 可配置 (默认 256)
     """
 
-    def __init__(self, face_embedding_dim=512, fingerprint_embedding_dim=256,
-                 num_classes=100, hidden_dim=512, dropout_rate=0.5,
-                 fusion_method='concat'):
-        super(EnhancedFusionModel, self).__init__()
+    def __init__(self, face_embedding_dim=512, fingerprint_embedding_dim=512,
+                 num_classes=300, fusion_dim=256, dropout_rate=0.3, use_arcface=True,
+                 arc_s=64.0, arc_m=0.5):
+        super().__init__()
 
-        self.face_embedding_dim = face_embedding_dim
-        self.fingerprint_embedding_dim = fingerprint_embedding_dim
+        # 特征维度验证
+        assert face_embedding_dim == 512, f"Face embedding dim must be 512, got {face_embedding_dim}"
+        assert fingerprint_embedding_dim == 512, f"Fingerprint embedding dim must be 512, got {fingerprint_embedding_dim}"
+
+        self.face_dim = face_embedding_dim
+        self.fp_dim = fingerprint_embedding_dim
         self.num_classes = num_classes
-        self.fusion_method = fusion_method
+        self.fusion_dim = fusion_dim
+        self.use_arcface = use_arcface
 
-        if fusion_method == 'concat':
-            # 简单拼接 + MLP
-            fused_dim = face_embedding_dim + fingerprint_embedding_dim
-            # LayerNorm 稳定数值分布
-            self.fusion_norm = nn.LayerNorm(fused_dim)
-            self.fusion_layers = nn.Sequential(
-                nn.Linear(fused_dim, hidden_dim),
-                nn.BatchNorm1d(hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Dropout(dropout_rate)
-            )
-            # 特征输出层（用于ArcFace）
-            self.feature_layer = nn.Linear(hidden_dim, hidden_dim)
-            self.feature_norm = nn.LayerNorm(hidden_dim)
-            # 占位符分类器（用于加载检查点）
-            self._classifier = None
+        # 模态投影
+        self.face_proj = ModalityProjection(face_embedding_dim, fusion_dim)
+        self.fp_proj = ModalityProjection(fingerprint_embedding_dim, fusion_dim)
 
-        elif fusion_method == 'attention_fusion':
-            # LayerNorm 稳定数值分布
-            self.fusion_norm = nn.LayerNorm(face_embedding_dim + fingerprint_embedding_dim)
-            # 注意力融合 - 分别计算每个模态的注意力权重
-            self.face_attention = nn.Sequential(
-                nn.Linear(face_embedding_dim, face_embedding_dim // 4),
-                nn.ReLU(inplace=True),
-                nn.Linear(face_embedding_dim // 4, 1),
-                nn.Sigmoid()
-            )
+        # 融合权重
+        self.fusion_weight = nn.Parameter(torch.tensor([0.5, 0.5]))
 
-            self.fp_attention = nn.Sequential(
-                nn.Linear(fingerprint_embedding_dim, fingerprint_embedding_dim // 4),
-                nn.ReLU(inplace=True),
-                nn.Linear(fingerprint_embedding_dim // 4, 1),
-                nn.Sigmoid()
-            )
+        # Dropout
+        self.dropout = nn.Dropout(dropout_rate)
 
-            self.fusion_layers = nn.Sequential(
-                nn.Linear(face_embedding_dim + fingerprint_embedding_dim, hidden_dim),
-                nn.BatchNorm1d(hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Dropout(dropout_rate)
-            )
-            self.feature_layer = nn.Linear(hidden_dim, hidden_dim)
-            self.feature_norm = nn.LayerNorm(hidden_dim)
-            self._classifier = None
-
-        elif fusion_method == 'cross_attention':
-            # LayerNorm 稳定数值分布
-            self.fusion_norm = nn.LayerNorm(face_embedding_dim * 2)
-            # 跨模态注意力 - 先投影到相同维度
-            self.cross_proj = nn.Linear(fingerprint_embedding_dim, face_embedding_dim)
-            self.cross_attention = CrossModalAttention(
-                embed_dim=face_embedding_dim,
-                num_heads=8
-            )
-
-            self.fusion_layers = nn.Sequential(
-                nn.Linear(face_embedding_dim * 2, hidden_dim),
-                nn.BatchNorm1d(hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Dropout(dropout_rate)
-            )
-            self.feature_layer = nn.Linear(hidden_dim, hidden_dim)
-            self.feature_norm = nn.LayerNorm(hidden_dim)
-            self._classifier = None
-
-        elif fusion_method == 'tensor_fusion':
-            # 张量融合 (更复杂的交互) - 已有内置norm
-            self.tensor_fusion = TensorFusion(
-                face_dim=face_embedding_dim,
-                fingerprint_dim=fingerprint_embedding_dim,
-                hidden_dim=hidden_dim
-            )
-
-            self.fusion_layers = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.BatchNorm1d(hidden_dim // 2),
-                nn.ReLU(inplace=True),
-                nn.Dropout(dropout_rate)
-            )
-            self.feature_layer = nn.Linear(hidden_dim // 2, hidden_dim)
-            self.feature_norm = nn.LayerNorm(hidden_dim)
-            self._classifier = None
+        # 分类器
+        if use_arcface:
+            from ..losses.arcface import ArcMarginProduct
+            self.classifier = ArcMarginProduct(fusion_dim, num_classes, s=arc_s, m=arc_m)
         else:
-            raise ValueError(f"不支持的融合方法: {fusion_method}")
+            self.classifier = nn.Linear(fusion_dim, num_classes)
+            self._init_classifier()
 
-        # ArcFace 分类器占位符（外部设置）
-        self.arc_classifier = None
+    def _init_classifier(self):
+        """Xavier初始化分类器"""
+        nn.init.xavier_uniform_(self.classifier.weight)
+        nn.init.zeros_(self.classifier.bias)
 
-        self._initialize_weights()
+    def forward(self, face_features, fp_features, labels=None):
+        # 投影到统一空间
+        face_proj = self.face_proj(face_features)
+        fp_proj = self.fp_proj(fp_features)
 
-    @property
-    def classifier(self):
-        """获取分类器（用于兼容性）"""
-        return self._classifier
+        # 加权融合
+        weights = F.softmax(self.fusion_weight, dim=0)
+        fused = weights[0] * face_proj + weights[1] * fp_proj
+        fused = self.dropout(fused)
 
-    @classifier.setter
-    def classifier(self, value):
-        """设置分类器"""
-        self._classifier = value
+        # 分类 (ArcFace 或普通分类)
+        return self.classifier(fused, labels)
 
-    def _extract_fused_features(self, face_features, fingerprint_features):
+    def extract_fused_features(self, face_features, fp_features):
         """提取融合特征（不含分类）"""
-        # L2归一化输入特征
-        face_norm = F.normalize(face_features, p=2, dim=1)
-        fp_norm = F.normalize(fingerprint_features, p=2, dim=1)
+        face_proj = self.face_proj(face_features)
+        fp_proj = self.fp_proj(fp_features)
+        weights = F.softmax(self.fusion_weight, dim=0)
+        fused = weights[0] * face_proj + weights[1] * fp_proj
+        return fused
 
-        if self.fusion_method == 'concat':
-            fused = torch.cat([face_norm, fp_norm], dim=1)
-            fused = self.fusion_norm(fused)
-            fused = self.fusion_layers(fused)
+    def init_classifier_from_pretrained(self, face_ckpt_path, fp_ckpt_path, device):
+        """从预训练单模态模型加载分类器权重"""
+        import os
 
-        elif self.fusion_method == 'attention_fusion':
-            face_weight = self.face_attention(face_norm)
-            fp_weight = self.fp_attention(fp_norm)
-            attended_face = face_norm * face_weight
-            attended_fp = fp_norm * fp_weight
-            fused = torch.cat([attended_face, attended_fp], dim=1)
-            fused = self.fusion_norm(fused)
-            fused = self.fusion_layers(fused)
+        face_loaded = False
+        fp_loaded = False
 
-        elif self.fusion_method == 'cross_attention':
-            projected_fp = self.cross_proj(fp_norm)
-            attended = self.cross_attention(face_norm, projected_fp)
-            fused = torch.cat([face_norm, attended], dim=1)
-            fused = self.fusion_norm(fused)
-            fused = self.fusion_layers(fused)
+        if face_ckpt_path and os.path.exists(face_ckpt_path):
+            try:
+                ckpt = torch.load(face_ckpt_path, map_location=device, weights_only=False)
+                state = ckpt.get('model_state', ckpt)
+                if 'classifier.weight' in state:
+                    self.classifier.weight.data = state['classifier.weight'].clone()
+                    self.classifier.bias.data = state.get('classifier.bias',
+                        torch.zeros(self.num_classes)).clone()
+                    face_loaded = True
+            except Exception as e:
+                print(f"[Fusion] Face classifier load failed: {e}")
 
-        elif self.fusion_method == 'tensor_fusion':
-            fused = self.tensor_fusion(face_norm, fp_norm)
-            fused = self.fusion_norm(fused)
-            fused = self.fusion_layers(fused)
+        if fp_ckpt_path and os.path.exists(fp_ckpt_path):
+            try:
+                ckpt = torch.load(fp_ckpt_path, map_location=device, weights_only=False)
+                state = ckpt.get('model_state', ckpt)
+                if 'classifier.weight' in state:
+                    if face_loaded:
+                        self.classifier.weight.data = (
+                            self.classifier.weight.data + state['classifier.weight'].clone()
+                        ) / 2
+                        self.classifier.bias.data = (
+                            self.classifier.bias.data + state.get('classifier.bias',
+                                torch.zeros(self.num_classes)).clone()
+                        ) / 2
+                    else:
+                        self.classifier.weight.data = state['classifier.weight'].clone()
+                        self.classifier.bias.data = state.get('classifier.bias',
+                            torch.zeros(self.num_classes)).clone()
+                    fp_loaded = True
+            except Exception as e:
+                print(f"[Fusion] FP classifier load failed: {e}")
 
-        # 输出归一化特征
-        output_features = self.feature_norm(self.feature_layer(fused))
-        output_features = F.normalize(output_features, p=2, dim=1)
+        return face_loaded, fp_loaded
 
-        return output_features
 
-    def forward(self, face_features, fingerprint_features, labels=None):
-        """前向传播
+class AdaptiveFusionModel(nn.Module):
+    """自适应融合模型 - 使用注意力机制学习模态权重
 
-        Args:
-            face_features: 人脸特征 [batch, face_dim]
-            fingerprint_features: 指纹特征 [batch, fp_dim]
-            labels: 标签（用于ArcFace训练）
-        """
-        fused_features = self._extract_fused_features(face_features, fingerprint_features)
+    特征维度验证：
+    - face_embedding_dim: 512 (标准)
+    - fingerprint_embedding_dim: 512 (标准)
+    - fusion_dim: 可配置 (默认 256)
+    """
 
-        # 训练模式：使用ArcFace（如果设置）
-        if self.training and labels is not None and self.arc_classifier is not None:
-            return self.arc_classifier(fused_features, labels)
+    def __init__(self, face_embedding_dim=512, fingerprint_embedding_dim=512,
+                 num_classes=300, fusion_dim=256, dropout_rate=0.3, use_arcface=True,
+                 arc_s=64.0, arc_m=0.5):
+        super().__init__()
 
-        # 评估模式或无ArcFace：返回特征（用于验证）或直接返回分类结果
-        if self.arc_classifier is not None:
-            logits = self.arc_classifier(fused_features, labels) if labels is not None else self.arc_classifier(fused_features)
-            if self.training:
-                return logits
-            return logits, fused_features
+        # 特征维度验证
+        assert face_embedding_dim == 512, f"Face embedding dim must be 512, got {face_embedding_dim}"
+        assert fingerprint_embedding_dim == 512, f"Fingerprint embedding dim must be 512, got {fingerprint_embedding_dim}"
 
-        # 无ArcFace：使用内置分类器（返回logits）
-        return fused_features
+        self.face_dim = face_embedding_dim
+        self.fp_dim = fingerprint_embedding_dim
+        self.num_classes = num_classes
+        self.use_arcface = use_arcface
 
-    def _initialize_weights(self):
-        """初始化模型权重"""
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
+        # 模态投影
+        self.face_proj = ModalityProjection(face_embedding_dim, fusion_dim)
+        self.fp_proj = ModalityProjection(fingerprint_embedding_dim, fusion_dim)
 
-    def forward(self, face_features, fingerprint_features):
-        # 🔧 【指令A】在拼接后应用 LayerNorm 稳定数值
-        if self.fusion_method == 'concat':
-            fused = torch.cat([face_features, fingerprint_features], dim=1)
-            fused = self.fusion_norm(fused)
-            return self.classifier(fused)
+        # 注意力权重网络
+        self.attention = nn.Sequential(
+            nn.Linear(fusion_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2),
+            nn.Softmax(dim=-1)
+        )
 
-        elif self.fusion_method == 'attention_fusion':
-            # 分别计算注意力权重
-            face_weight = self.face_attention(face_features)  # [batch, 1]
-            fp_weight = self.fp_attention(fingerprint_features)  # [batch, 1]
+        # 特征增强
+        self.enhancer = nn.Sequential(
+            nn.Linear(fusion_dim, fusion_dim * 2),
+            nn.LayerNorm(fusion_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(fusion_dim * 2, fusion_dim),
+        )
 
-            # 应用注意力权重
-            attended_face = face_features * face_weight
-            attended_fp = fingerprint_features * fp_weight
+        # 分类器
+        if use_arcface:
+            from ..losses.arcface import ArcMarginProduct
+            self.classifier = ArcMarginProduct(fusion_dim, num_classes, s=arc_s, m=arc_m)
+        else:
+            self.classifier = nn.Linear(fusion_dim, num_classes)
+            self._init_classifier()
 
-            # 拼接后应用 LayerNorm
-            combined = torch.cat([attended_face, attended_fp], dim=1)
-            combined = self.fusion_norm(combined)
-            return self.classifier(combined)
+    def _init_classifier(self):
+        """Xavier初始化分类器"""
+        nn.init.xavier_uniform_(self.classifier.weight)
+        nn.init.zeros_(self.classifier.bias)
 
-        elif self.fusion_method == 'cross_attention':
-            # 先将指纹特征投影到相同维度
-            fp_proj = self.cross_proj(fingerprint_features)
-            # 人脸特征作为query，指纹特征作为key/value
-            attended_features = self.cross_attention(face_features, fp_proj)
-            combined = torch.cat([face_features, attended_features], dim=1)
-            combined = self.fusion_norm(combined)
-            return self.classifier(combined)
+    def forward(self, face_features, fp_features, labels=None):
+        # 投影
+        face_proj = self.face_proj(face_features)
+        fp_proj = self.fp_proj(fp_features)
 
-        elif self.fusion_method == 'tensor_fusion':
-            fused = self.tensor_fusion(face_features, fingerprint_features)
-            return self.classifier(fused)
+        # 注意力加权
+        concat = torch.stack([face_proj, fp_proj], dim=1)
+        weights = self.attention(concat.mean(dim=1))
+        fused = (concat * weights.unsqueeze(-1)).sum(dim=1)
 
-    def extract_features(self, face_features, fingerprint_features):
-        """提取融合特征（用于特征分析）"""
-        with torch.no_grad():
-            if self.fusion_method == 'concat':
-                fused = torch.cat([face_features, fingerprint_features], dim=1)
-                # 返回第一层特征
-                x = self.classifier[0](fused)
-                x = self.classifier[1](x)  # BatchNorm
-                x = self.classifier[2](x)  # ReLU
-                return x
+        # 特征增强
+        fused = fused + self.enhancer(fused)
 
-            elif self.fusion_method == 'attention_fusion':
-                # 分别计算注意力权重
-                face_weight = self.face_attention(face_features)
-                fp_weight = self.fp_attention(fingerprint_features)
+        # 分类 (ArcFace 或普通分类)
+        return self.classifier(fused, labels)
 
-                # 应用注意力权重
-                attended_face = face_features * face_weight
-                attended_fp = fingerprint_features * fp_weight
+    def extract_fused_features(self, face_features, fp_features):
+        """提取融合特征"""
+        face_proj = self.face_proj(face_features)
+        fp_proj = self.fp_proj(fp_features)
+        concat = torch.stack([face_proj, fp_proj], dim=1)
+        weights = self.attention(concat.mean(dim=1))
+        fused = (concat * weights.unsqueeze(-1)).sum(dim=1)
+        return fused
 
-                # 拼接后分类
-                combined = torch.cat([attended_face, attended_fp], dim=1)
-                x = self.classifier[0](combined)
-                x = self.classifier[1](x)
-                x = self.classifier[2](x)
-                return x
+    def init_classifier_from_pretrained(self, face_ckpt_path, fp_ckpt_path, device):
+        """从预训练单模态模型加载分类器权重"""
+        import os
 
-            elif self.fusion_method == 'cross_attention':
-                fp_proj = self.cross_proj(fingerprint_features)
-                attended_features = self.cross_attention(face_features, fp_proj)
-                combined = torch.cat([face_features, attended_features], dim=1)
-                x = self.classifier[0](combined)
-                x = self.classifier[1](x)
-                x = self.classifier[2](x)
-                return x
+        face_loaded = False
+        fp_loaded = False
 
-            elif self.fusion_method == 'tensor_fusion':
-                fused = self.tensor_fusion(face_features, fingerprint_features)
-                x = self.classifier[0](fused)
-                x = self.classifier[1](x)
-                x = self.classifier[2](x)
-                return x
+        if face_ckpt_path and os.path.exists(face_ckpt_path):
+            try:
+                ckpt = torch.load(face_ckpt_path, map_location=device, weights_only=False)
+                state = ckpt.get('model_state', ckpt)
+                if 'classifier.weight' in state:
+                    self.classifier.weight.data = state['classifier.weight'].clone()
+                    self.classifier.bias.data = state.get('classifier.bias',
+                        torch.zeros(self.num_classes)).clone()
+                    face_loaded = True
+            except Exception:
+                pass
+
+        if fp_ckpt_path and os.path.exists(fp_ckpt_path):
+            try:
+                ckpt = torch.load(fp_ckpt_path, map_location=device, weights_only=False)
+                state = ckpt.get('model_state', ckpt)
+                if 'classifier.weight' in state:
+                    if face_loaded:
+                        self.classifier.weight.data = (
+                            self.classifier.weight.data + state['classifier.weight'].clone()
+                        ) / 2
+                        self.classifier.bias.data = (
+                            self.classifier.bias.data + state.get('classifier.bias',
+                                torch.zeros(self.num_classes)).clone()
+                        ) / 2
+                    else:
+                        self.classifier.weight.data = state['classifier.weight'].clone()
+                        self.classifier.bias.data = state.get('classifier.bias',
+                            torch.zeros(self.num_classes)).clone()
+                    fp_loaded = True
+            except Exception:
+                pass
+
+        return face_loaded, fp_loaded
+
+
+class GatedFusionModel(nn.Module):
+    """门控融合模型 - 论文常用方案 (Gated Multimodal Fusion)
+
+    通过门控网络学习模态间的动态权重，
+    类似 ResNet 的残差门控机制。
+
+    特点：
+    - 门控值由两个模态的联合表示生成
+    - 可解释性强（门控值反映模态贡献度）
+    - 训练稳定
+
+    参考：Are You Acceptable? - Multimodal Gated Fusion
+    """
+
+    def __init__(self, face_embedding_dim=512, fingerprint_embedding_dim=512,
+                 num_classes=300, fusion_dim=256, dropout_rate=0.3, use_arcface=True,
+                 arc_s=64.0, arc_m=0.5, gate_hidden_dim=128):
+        super().__init__()
+
+        self.face_dim = face_embedding_dim
+        self.fp_dim = fingerprint_embedding_dim
+        self.num_classes = num_classes
+        self.use_arcface = use_arcface
+
+        # 模态投影
+        self.face_proj = ModalityProjection(face_embedding_dim, fusion_dim)
+        self.fp_proj = ModalityProjection(fingerprint_embedding_dim, fusion_dim)
+
+        # 门控网络 - 基于两个模态的联合表示
+        self.gate_fc = nn.Sequential(
+            nn.Linear(fusion_dim * 2, gate_hidden_dim),
+            nn.LayerNorm(gate_hidden_dim),
+            nn.GELU(),
+            nn.Linear(gate_hidden_dim, 1),
+            nn.Sigmoid()
+        )
+
+        # 特征增强（可选的残差连接）
+        self.enhancer = nn.Sequential(
+            nn.Linear(fusion_dim, fusion_dim * 2),
+            nn.LayerNorm(fusion_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(fusion_dim * 2, fusion_dim),
+        )
+
+        # Dropout
+        self.dropout = nn.Dropout(dropout_rate)
+
+        # 分类器
+        if use_arcface:
+            from ..losses.arcface import ArcMarginProduct
+            self.classifier = ArcMarginProduct(fusion_dim, num_classes, s=arc_s, m=arc_m)
+        else:
+            self.classifier = nn.Linear(fusion_dim, num_classes)
+            self._init_classifier()
+
+    def _init_classifier(self):
+        """Xavier初始化分类器"""
+        nn.init.xavier_uniform_(self.classifier.weight)
+        nn.init.zeros_(self.classifier.bias)
+
+    def forward(self, face_features, fp_features, labels=None):
+        # 投影到统一空间
+        face_proj = self.face_proj(face_features)  # [B, fusion_dim]
+        fp_proj = self.fp_proj(fp_features)        # [B, fusion_dim]
+
+        # 门控计算：基于联合表示
+        concat_features = torch.cat([face_proj, fp_proj], dim=1)  # [B, 2*fusion_dim]
+        gate = self.gate_fc(concat_features)  # [B, 1], 0~1 之间
+
+        # 门控融合
+        fused = gate * face_proj + (1 - gate) * fp_proj  # [B, fusion_dim]
+
+        # 特征增强（残差）
+        fused = fused + self.dropout(self.enhancer(fused))
+
+        # 分类
+        return self.classifier(fused, labels)
+
+    def extract_fused_features(self, face_features, fp_features):
+        """提取融合特征"""
+        face_proj = self.face_proj(face_features)
+        fp_proj = self.fp_proj(fp_features)
+        concat_features = torch.cat([face_proj, fp_proj], dim=1)
+        gate = self.gate_fc(concat_features)
+        fused = gate * face_proj + (1 - gate) * fp_proj
+        return fused + self.enhancer(fused)
+
+    def get_gate_values(self, face_features, fp_features):
+        """获取门控值（用于分析模态贡献度）"""
+        face_proj = self.face_proj(face_features)
+        fp_proj = self.fp_proj(fp_features)
+        concat_features = torch.cat([face_proj, fp_proj], dim=1)
+        gate = self.gate_fc(concat_features)
+        return gate  # 1 = 全用人脸, 0 = 全用指纹
+
+
+class HierarchicalFusionModel(nn.Module):
+    """层级融合模型 - 粗粒度+细粒度融合
+
+    多层级特征交互：
+    Level 1: 模态投影
+    Level 2: 跨模态注意力交互
+    Level 3: 融合输出
+
+    特点：
+    - 更丰富的模态交互
+    - 可捕获细粒度对应关系
+    - 适合异构模态（人脸+指纹差异大）
+    """
+
+    def __init__(self, face_embedding_dim=512, fingerprint_embedding_dim=512,
+                 num_classes=300, fusion_dim=256, dropout_rate=0.3, use_arcface=True,
+                 arc_s=64.0, arc_m=0.5, num_heads=4):
+        super().__init__()
+
+        self.face_dim = face_embedding_dim
+        self.fp_dim = fingerprint_embedding_dim
+        self.num_classes = num_classes
+        self.use_arcface = use_arcface
+
+        # Level 1: 模态投影
+        self.face_proj = ModalityProjection(face_embedding_dim, fusion_dim)
+        self.fp_proj = ModalityProjection(fingerprint_embedding_dim, fusion_dim)
+
+        # Level 2: 跨模态注意力交互
+        self.cross_attention = CrossModalAttention(
+            embed_dim=fusion_dim,
+            num_heads=num_heads,
+            dropout=dropout_rate
+        )
+
+        # Level 3: 融合特征压缩
+        self.fusion_encoder = nn.Sequential(
+            nn.Linear(fusion_dim * 4, fusion_dim * 2),  # 原始 + 交叉注意力
+            nn.LayerNorm(fusion_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(fusion_dim * 2, fusion_dim),
+        )
+
+        # 分类器
+        if use_arcface:
+            from ..losses.arcface import ArcMarginProduct
+            self.classifier = ArcMarginProduct(fusion_dim, num_classes, s=arc_s, m=arc_m)
+        else:
+            self.classifier = nn.Linear(fusion_dim, num_classes)
+            self._init_classifier()
+
+    def _init_classifier(self):
+        """Xavier初始化分类器"""
+        nn.init.xavier_uniform_(self.classifier.weight)
+        nn.init.zeros_(self.classifier.bias)
+
+    def forward(self, face_features, fp_features, labels=None):
+        # Level 1: 投影
+        face_proj = self.face_proj(face_features)  # [B, D]
+        fp_proj = self.fp_proj(fp_features)        # [B, D]
+
+        # Level 2: 跨模态注意力
+        face_to_fp, fp_to_face = self.cross_attention(face_proj, fp_proj)
+
+        # Level 3: 融合
+        fused = self.fusion_encoder(
+            torch.cat([face_proj, fp_proj, face_to_fp, fp_to_face], dim=1)
+        )
+
+        # 分类
+        return self.classifier(fused, labels)
+
+    def extract_fused_features(self, face_features, fp_features):
+        """提取融合特征"""
+        face_proj = self.face_proj(face_features)
+        fp_proj = self.fp_proj(fp_features)
+        face_to_fp, fp_to_face = self.cross_attention(face_proj, fp_proj)
+        fused = self.fusion_encoder(
+            torch.cat([face_proj, fp_proj, face_to_fp, fp_to_face], dim=1)
+        )
+        return fused
 
 
 class CrossModalAttention(nn.Module):
-    """跨模态注意力机制"""
+    """跨模态注意力模块
 
-    def __init__(self, embed_dim, num_heads=8):
+    计算两个模态之间的相互注意力：
+    - face_to_fp: 人脸对指纹的注意力
+    - fp_to_face: 指纹对人脸的注意力
+    """
+
+    def __init__(self, embed_dim, num_heads=4, dropout=0.1):
         super().__init__()
-        self.attention = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
-        self.norm = nn.LayerNorm(embed_dim)
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
 
-    def forward(self, query, key_value):
-        # query: face_features, key_value: fingerprint_features
-        # 需要扩展维度以适应多头注意力
-        query = query.unsqueeze(1)  # [batch, 1, dim]
-        key_value = key_value.unsqueeze(1)  # [batch, 1, dim]
+        # Query, Key, Value 投影
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
 
-        attended, _ = self.attention(query, key_value, key_value)
-        attended = attended.squeeze(1)  # [batch, dim]
+        self.dropout = nn.Dropout(dropout)
+        self.scale = self.head_dim ** -0.5
 
-        return self.norm(attended + query.squeeze(1))
+    def forward(self, x1, x2):
+        """
+        Args:
+            x1: [B, D] 模态1特征
+            x2: [B, D] 模态2特征
+        Returns:
+            x1_to_x2: [B, D] x1对x2的注意力加权
+            x2_to_x1: [B, D] x2对x1的注意力加权
+        """
+        B, D = x1.shape
 
+        # x1 -> x2 的注意力
+        q1 = self.q_proj(x1).view(B, self.num_heads, self.head_dim)  # [B, H, d]
+        k2 = self.k_proj(x2).view(B, self.num_heads, self.head_dim)
+        v2 = self.v_proj(x2).view(B, self.num_heads, self.head_dim)
 
-class TensorFusion(nn.Module):
-    """张量融合模块 - 学习模态间的复杂交互"""
+        attn1 = torch.einsum('bhd,bhd->bh', q1, k2) * self.scale  # [B, H]
+        attn1 = F.softmax(attn1, dim=-1)
+        attn1 = self.dropout(attn1)
 
-    def __init__(self, face_dim, fingerprint_dim, hidden_dim):
-        super().__init__()
+        x1_to_x2 = torch.einsum('bh,bhd->bhd', attn1, v2).reshape(B, D)  # [B, D]
+        x1_to_x2 = self.out_proj(x1_to_x2)
 
-        # 外积张量融合
-        self.tensor_weight = nn.Parameter(torch.randn(face_dim, fingerprint_dim, hidden_dim))
-        self.bias = nn.Parameter(torch.zeros(hidden_dim))
+        # x2 -> x1 的注意力
+        q2 = self.q_proj(x2).view(B, self.num_heads, self.head_dim)
+        k1 = self.k_proj(x1).view(B, self.num_heads, self.head_dim)
+        v1 = self.v_proj(x1).view(B, self.num_heads, self.head_dim)
 
-        # 残差连接
-        self.residual_proj = nn.Linear(face_dim + fingerprint_dim, hidden_dim)
+        attn2 = torch.einsum('bhd,bhd->bh', q2, k1) * self.scale
+        attn2 = F.softmax(attn2, dim=-1)
+        attn2 = self.dropout(attn2)
 
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(0.1)
+        x2_to_x1 = torch.einsum('bh,bhd->bhd', attn2, v1).reshape(B, D)
+        x2_to_x1 = self.out_proj(x2_to_x1)
 
-    def forward(self, face_feat, fingerprint_feat):
-        # 张量融合: face_feat ⊗ fingerprint_feat
-        # [batch, face_dim] -> [batch, face_dim, 1]
-        face_expanded = face_feat.unsqueeze(2)
-        # [batch, fingerprint_dim] -> [batch, 1, fingerprint_dim]
-        fp_expanded = fingerprint_feat.unsqueeze(1)
-
-        # 外积: [batch, face_dim, fingerprint_dim]
-        outer_product = torch.matmul(face_expanded, fp_expanded)
-
-        # 与张量权重相乘: [batch, face_dim, fingerprint_dim] @ [face_dim, fingerprint_dim, hidden_dim]
-        # -> [batch, hidden_dim]
-        fused = torch.einsum('bij,ijk->bk', outer_product, self.tensor_weight)
-
-        # 残差连接
-        residual = self.residual_proj(torch.cat([face_feat, fingerprint_feat], dim=1))
-
-        output = fused + residual + self.bias
-        return self.norm(self.dropout(output))
-
-
-# 保持向后兼容性
-class FusionModel(EnhancedFusionModel):
-    """向后兼容的简单融合模型"""
-
-    def __init__(self, face_embedding_dim=512, fingerprint_embedding_dim=512,
-                 num_classes=100, hidden_dim=256, dropout_rate=0.5):
-        super().__init__(
-            face_embedding_dim=face_embedding_dim,
-            fingerprint_embedding_dim=fingerprint_embedding_dim,
-            num_classes=num_classes,
-            hidden_dim=hidden_dim,
-            dropout_rate=dropout_rate,
-            fusion_method='concat'
-        )
+        return x1_to_x2, x2_to_x1
 
 
-def create_fusion_model(fusion_method='concat', **kwargs):
-    """工厂函数：创建融合模型"""
-    return EnhancedFusionModel(fusion_method=fusion_method, **kwargs)
-
-
-def create_enhanced_fusion_model(**kwargs):
-    """创建增强版融合模型（别名）"""
-    return EnhancedFusionModel(**kwargs)
-
-
-# ============================================================
-# Fusion Utilities - Feature Alignment for Face-Fingerprint Fusion
-# ============================================================
-
-def get_face_embedding_dim():
-    """Get standard face embedding dimension."""
-    return 512
-
-
-def get_fingerprint_embedding_dim():
-    """Get standard fingerprint embedding dimension."""
-    return 256
-
-
-def align_embedding_dims(face_features, fingerprint_features):
-    """Align face (512D) and fingerprint (256D) embeddings for fusion.
-
-    Projects face features from 512D to 256D using a linear projection.
+def create_fusion_model(fusion_method='simple', **kwargs):
+    """工厂函数：创建融合模型
 
     Args:
-        face_features: Face embeddings [B, 512]
-        fingerprint_features: Fingerprint embeddings [B, 256]
+        fusion_method: 'simple', 'adaptive', 'gated', 'hierarchical'
+        **kwargs: 传递给模型的其他参数
 
     Returns:
-        Tuple of aligned embeddings (both 256D)
+        融合模型实例
     """
-    projection = nn.Linear(512, 256)
-    face_aligned = projection(face_features)
-    face_aligned = F.normalize(face_aligned, p=2, dim=1)
-    return face_aligned, fingerprint_features
+    fusion_methods = {
+        'simple': SimpleFusionModel,
+        'adaptive': AdaptiveFusionModel,
+        'gated': GatedFusionModel,
+        'hierarchical': HierarchicalFusionModel,
+    }
+
+    if fusion_method not in fusion_methods:
+        raise ValueError(
+            f"Unknown fusion method: {fusion_method}. "
+            f"Available: {list(fusion_methods.keys())}"
+        )
+
+    return fusion_methods[fusion_method](**kwargs)

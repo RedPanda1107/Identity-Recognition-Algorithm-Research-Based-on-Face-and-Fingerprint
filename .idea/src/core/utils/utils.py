@@ -1,6 +1,6 @@
 # 辅助函数库
-import os
 import logging
+import os
 import yaml
 import torch
 import torch.nn as nn
@@ -53,11 +53,42 @@ def setup_logger(log_dir='./logs', log_file='training.log', level=logging.INFO, 
     return logger
 
 
-def load_config(config_path):
-    """加载YAML配置文件"""
+def load_config(config_path, merge_shared=True):
+    """加载YAML配置文件，并自动合并 shared 参数
+
+    Args:
+        config_path: 配置文件路径
+        merge_shared: 是否从 unified_config.yaml 合并共享参数
+
+    Returns:
+        合并后的配置字典
+    """
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
+
+    if merge_shared and config is not None:
+        # 尝试加载统一配置并合并共享参数
+        config_dir = os.path.dirname(os.path.abspath(config_path))
+        unified_path = os.path.join(config_dir, 'unified_config.yaml')
+        if os.path.exists(unified_path):
+            with open(unified_path, 'r', encoding='utf-8') as f:
+                unified = yaml.safe_load(f)
+            if unified and 'shared' in unified:
+                # 深度合并：配置文件的参数优先
+                config = _deep_merge(unified['shared'], config)
+
     return config
+
+
+def _deep_merge(shared, specific):
+    """深度合并两个字典，specific 优先"""
+    result = shared.copy()
+    for key, value in specific.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
 
 
 def save_config(config, save_path):
@@ -258,16 +289,39 @@ def calculate_biometric_metrics(y_true, y_prob, num_classes=None):
     }
 
     # 计算整体EER (所有类别一起考虑)
-    # 使用最大预测概率作为分数，所有样本设为正类进行简化计算
+    # 使用余弦相似度风格的计算：同人 vs 异人
+    # 这里用最大预测概率作为相似度分数
     y_score_flat = np.max(y_prob, axis=1) if len(np.array(y_prob).shape) > 1 else np.array(y_prob)
-    y_binary_overall = np.ones(len(y_true))  # 所有样本都是正类
 
-    try:
-        fpr_overall, tpr_overall, _ = roc_curve(y_binary_overall, y_score_flat)
-        eer_overall = (fpr_overall[np.argmin(np.abs(fpr_overall - (1-tpr_overall)))] +
-                       (1-tpr_overall)[np.argmin(np.abs(fpr_overall - (1-tpr_overall)))]) / 2
+    # 正确的 EER 计算：需要正样本和负样本的分数分布
+    # 同人样本（同 ground truth 类别的样本）→ 正样本
+    # 异人样本（不同类别的样本）→ 负样本
+    positive_scores = []
+    negative_scores = []
+
+    for i, true_label in enumerate(y_true):
+        score = y_score_flat[i]
+        if np.array(y_prob).ndim > 1:
+            # 同类别的其他样本的平均分数作为正样本分数
+            same_class_mask = np.array(y_true) == true_label
+            same_class_scores = y_score_flat[same_class_mask]
+            if len(same_class_scores) > 1:
+                positive_scores.append(np.mean(same_class_scores))
+            # 异类别的平均分数作为负样本分数
+            diff_class_mask = np.array(y_true) != true_label
+            diff_class_scores = y_score_flat[diff_class_mask]
+            if len(diff_class_scores) > 0:
+                negative_scores.append(np.mean(diff_class_scores))
+
+    if len(positive_scores) >= 10 and len(negative_scores) >= 10:
+        y_binary_overall = np.array([1] * len(positive_scores) + [0] * len(negative_scores))
+        y_scores_combined = np.array(positive_scores + negative_scores)
+        fpr_overall, tpr_overall, _ = roc_curve(y_binary_overall, y_scores_combined)
+        fnr_overall = 1 - tpr_overall
+        eer_idx = np.nanargmin(np.abs(fpr_overall - fnr_overall))
+        eer_overall = (fpr_overall[eer_idx] + fnr_overall[eer_idx]) / 2
         auc_overall = auc(fpr_overall, tpr_overall)
-    except Exception:
+    else:
         eer_overall = np.mean(all_eers) if all_eers else 0.0
         auc_overall = np.mean(all_auc_scores) if all_auc_scores else 0.0
 
@@ -457,6 +511,8 @@ def save_biometric_results(biometric_results, save_path):
 
 def set_seed(seed=42):
     """设置随机种子以确保可重现性"""
+    import random
+    random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -504,23 +560,19 @@ def save_results_to_json(results, save_path):
         json.dump(serializable_results, f, indent=2, ensure_ascii=False)
 
 
-class AverageMeter:
-    """计算平均值和当前值的实用工具"""
+def compute_classification_metrics(y_true, y_pred):
+    """计算分类指标（precision / recall / f1）。
 
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
+    供各 Trainer 的 validate_epoch 共用。
+    """
+    from sklearn.metrics import precision_score, recall_score, f1_score
+    try:
+        precision = precision_score(y_true, y_pred, average='macro', zero_division=0)
+        recall = recall_score(y_true, y_pred, average='macro', zero_division=0)
+        f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    except Exception:
+        precision = recall = f1 = 0.0
+    return {"precision": precision, "recall": recall, "f1_score": f1}
 
 
 class TensorBoardWriter:

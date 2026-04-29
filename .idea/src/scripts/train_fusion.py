@@ -1,421 +1,379 @@
 #!/usr/bin/env python
 """
-Fusion training script for face + fingerprint multimodal recognition.
-Uses feature concatenation approach.
+融合模型训练脚本
+人脸 + 指纹 多模态特征融合
+
+实验模式：
+    --experiment_mode full             训练全部（baseline）
+    --experiment_mode fusion_only     冻结backbone，只训练融合层
+    --experiment_mode face_ablation   消融：指纹置零，测试单用人脸
+    --experiment_mode fp_ablation     消融：人脸置零，测试单用指纹
+
+推荐使用 experiments/fusion_experiments.py 进行完整实验
 """
-# Windows UTF-8 encoding fix
-import sys, io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 import os
 import sys
 import argparse
-from torch.utils.data import DataLoader
+import json
+from datetime import datetime
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
-# Add project root to path for imports
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
-from core.utils import load_config, set_seed, get_device, count_parameters, setup_logger, calculate_biometric_metrics, save_biometric_results
+from core.utils import load_config, set_seed, get_device, setup_logger
 from core.datasets.fusion_dataset import FusionDataset
 from core.models import create_model
 from core.trainers.fusion_trainer import FusionTrainer
-from core.losses.arcface import ArcMarginProduct
-import json
-from datetime import datetime
-import subprocess
+
+# 实验模式配置
+EXPERIMENT_MODES = {
+    'full': {'freeze_backbone': False, 'ablate_modality': None},
+    'fusion_only': {'freeze_backbone': True, 'ablate_modality': None},
+    'face_ablation': {'freeze_backbone': False, 'ablate_modality': 'fingerprint'},
+    'fp_ablation': {'freeze_backbone': False, 'ablate_modality': 'face'},
+}
 
 
 def parse_args():
-    # Default config path relative to script location
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(script_dir)
     default_config = os.path.join(project_root, "configs", "fusion_config.yaml")
 
-    parser = argparse.ArgumentParser(description="Train fusion model (face + fingerprint)")
+    parser = argparse.ArgumentParser(
+        description="Train fusion model (face + fingerprint)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+实验模式：
+  full             训练全部（baseline）
+  fusion_only      冻结backbone，只训练融合层
+  face_ablation   消融：指纹置零，测试单用人脸
+  fp_ablation     消融：人脸置零，测试单用指纹
+
+推荐使用 experiments/fusion_experiments.py 进行完整实验
+"""
+    )
     parser.add_argument("--config", type=str, default=default_config)
-    parser.add_argument("--experiment_name", type=str, default="fusion_recognition")
+    parser.add_argument("--experiment_name", type=str, default=None)
     parser.add_argument("--device", type=str, default="auto")
-    parser.add_argument("--fusion_method", type=str, default="concat",
-                       choices=['concat', 'attention_fusion', 'cross_attention', 'tensor_fusion'])
+    parser.add_argument("--fusion_method", type=str, default="simple",
+                       choices=['simple', 'adaptive', 'gated', 'hierarchical'],
+                       help="融合方法：simple/simple, adaptive/注意力, gated/门控, hierarchical/层级")
+    parser.add_argument("--experiment_mode", type=str, default="full",
+                       choices=list(EXPERIMENT_MODES.keys()),
+                       help="实验模式")
     parser.add_argument("--face_ckpt", type=str, default=None,
-                       help="Path to pretrained face model checkpoint")
+                       help="人脸预训练权重（用于fusion_only模式）")
     parser.add_argument("--fp_ckpt", type=str, default=None,
-                       help="Path to pretrained fingerprint model checkpoint")
+                       help="指纹预训练权重（用于fusion_only模式）")
+    parser.add_argument("--resume", type=str, default=None,
+                       help="Path to checkpoint to resume from")
     return parser.parse_args()
+
+
+def _normalize_paths(config, script_dir):
+    """统一路径解析逻辑"""
+    project_root = os.path.dirname(script_dir)
+
+    # 数据相关路径
+    for key in ['face_data_dir', 'fingerprint_data_dir', 'mapping_file']:
+        if key in config.get('paths', {}):
+            path = config['paths'][key]
+            if path and not os.path.isabs(path):
+                config['paths'][key] = os.path.join(project_root, path.lstrip('./'))
+
+    # 预训练模型路径
+    for key in ['pretrained_face', 'pretrained_fingerprint']:
+        if key in config.get('paths', {}):
+            path = config['paths'][key]
+            if path and not os.path.isabs(path):
+                config['paths'][key] = os.path.join(project_root, path.lstrip('./'))
+
+    return config
 
 
 def main():
     args = parse_args()
     config = load_config(args.config)
 
-    logger = setup_logger(
-        experiment_name=args.experiment_name,
-        log_dir=config["paths"].get("log_dir", "./logs"),
-        level=config.get("logging", {}).get("level", "INFO"),
-        logger_name="FusionRecognition"
-    )
-
-    # Normalize log_dir and checkpoint_dir to be under scripts/
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    default_log_dir = os.path.join(script_dir, "logs")
-    default_ckpt_dir = os.path.join(script_dir, "checkpoints")
+    project_root = os.path.dirname(script_dir)
+    config = _normalize_paths(config, script_dir)
 
-    log_dir = config["paths"].get("log_dir", default_log_dir)
-    if not os.path.isabs(log_dir):
-        log_dir = os.path.join(script_dir, log_dir.lstrip('./'))
+    # 获取实验模式配置
+    exp_config = EXPERIMENT_MODES[args.experiment_mode]
+    mode_suffix = f"_{args.experiment_mode}" if args.experiment_mode != 'full' else ""
+    experiment_name = args.experiment_name or f"fusion_{args.fusion_method}{mode_suffix}"
 
-    ckpt_dir = config["paths"].get("checkpoint_dir", default_ckpt_dir)
-    if not os.path.isabs(ckpt_dir):
-        ckpt_dir = os.path.join(script_dir, ckpt_dir.lstrip('./'))
+    # 目录
+    log_dir = os.path.join(script_dir, "logs", experiment_name)
+    ckpt_dir = os.path.join(script_dir, "checkpoints", "fusion", experiment_name)
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(ckpt_dir, exist_ok=True)
 
-    config["paths"]["log_dir"] = log_dir
-    config["paths"]["checkpoint_dir"] = ckpt_dir
+    # 日志
+    logger = setup_logger(experiment_name=experiment_name, log_dir=log_dir,
+                         level="INFO", logger_name="FusionTrain")
 
-    # Re-create logger with normalized path to ensure handlers use script-level logs dir
-    logger = setup_logger(
-        experiment_name=args.experiment_name,
-        log_dir=log_dir,
-        level=config.get("logging", {}).get("level", "INFO"),
-        logger_name="FusionRecognition"
-    )
+    # 记录实验模式
+    logger.info(f"=" * 60)
+    logger.info(f"实验模式: {args.experiment_mode}")
+    if args.experiment_mode == 'fusion_only':
+        logger.info(f"需要预训练权重: face={args.face_ckpt}, fp={args.fp_ckpt}")
+    elif args.experiment_mode == 'face_ablation':
+        logger.info(f"消融模式: 指纹置零，测试单用人脸")
+    elif args.experiment_mode == 'fp_ablation':
+        logger.info(f"消融模式: 人脸置零，测试单用指纹")
+    logger.info(f"=" * 60)
 
-    set_seed(config.get("misc", {}).get("seed", 42))
+    # TensorBoard
+    writer = SummaryWriter(log_dir=log_dir) if config.get('misc', {}).get('use_tensorboard', False) else None
+
+    seed = config.get('misc', {}).get('seed', 42)
+    set_seed(seed)
     device = get_device(args.device)
-    logger.info(f"Using device: {device}")
 
-    # Load datasets - convert relative paths to absolute
-    face_data_dir = config["paths"]["face_data_dir"]
-    if not os.path.isabs(face_data_dir):
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        face_data_dir = os.path.join(project_root, face_data_dir.lstrip('./'))
+    # 统一的数据集参数
+    split_ratio = config["data"].get("split_ratio", 0.8)
+    test_split_ratio = config["data"].get("test_split_ratio", 0.5)
+    gallery_per_person = config["data"].get("gallery_per_person", 3)
 
-    fingerprint_data_dir = config["paths"]["fingerprint_data_dir"]
-    if not os.path.isabs(fingerprint_data_dir):
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        fingerprint_data_dir = os.path.join(project_root, fingerprint_data_dir.lstrip('./'))
-
-    # 可选的映射文件
-    mapping_file = config["paths"].get("mapping_file")
-    if mapping_file and not os.path.isabs(mapping_file):
-        mapping_file = os.path.join(project_root, mapping_file.lstrip('./'))
-
+    # 数据集
     train_dataset = FusionDataset(
-        face_data_dir=face_data_dir,
-        fingerprint_data_dir=fingerprint_data_dir,
-        mapping_file=mapping_file,
-        mode="train",
-        face_image_size=config["data"]["face_image_size"],
-        fingerprint_image_size=config["data"]["fingerprint_image_size"],
-        augment=config["data"].get("use_augmentation", True)
+        face_data_dir=config['paths']['face_data_dir'],
+        fingerprint_data_dir=config['paths']['fingerprint_data_dir'],
+        mapping_file=config['paths'].get('mapping_file'),
+        mode='train',
+        face_image_size=int(config['data']['face_image_size']),
+        fingerprint_image_size=int(config['data']['fingerprint_image_size']),
+        augment=config['data'].get('use_augmentation', True),
+        split_ratio=split_ratio,
+        test_split_ratio=test_split_ratio,
+        gallery_per_person=gallery_per_person,
+        seed=seed
     )
-    # attach augmentation params from config so FusionDataset can build modality-specific transforms
-    train_dataset.augmentation_params = config["data"].get("augmentation", {}) or {}
+    train_dataset.augmentation_params = config['data'].get('augmentation', {}) or {}
 
     val_dataset = FusionDataset(
-        face_data_dir=face_data_dir,
-        fingerprint_data_dir=fingerprint_data_dir,
-        mapping_file=mapping_file,
-        mode="val",
-        face_image_size=config["data"]["face_image_size"],
-        fingerprint_image_size=config["data"]["fingerprint_image_size"],
-        augment=False
+        face_data_dir=config['paths']['face_data_dir'],
+        fingerprint_data_dir=config['paths']['fingerprint_data_dir'],
+        mapping_file=config['paths'].get('mapping_file'),
+        mode='val',
+        face_image_size=int(config['data']['face_image_size']),
+        fingerprint_image_size=int(config['data']['fingerprint_image_size']),
+        augment=False,
+        split_ratio=split_ratio,
+        test_split_ratio=test_split_ratio,
+        gallery_per_person=gallery_per_person,
+        class_to_idx=train_dataset.class_to_idx,
+        seed=seed
+    )
+
+    # 测试集（用于最终评估，仅在训练完成后使用）
+    test_dataset = FusionDataset(
+        face_data_dir=config['paths']['face_data_dir'],
+        fingerprint_data_dir=config['paths']['fingerprint_data_dir'],
+        mapping_file=config['paths'].get('mapping_file'),
+        mode='test',
+        face_image_size=int(config['data']['face_image_size']),
+        fingerprint_image_size=int(config['data']['fingerprint_image_size']),
+        augment=False,
+        split_ratio=split_ratio,
+        test_split_ratio=test_split_ratio,
+        gallery_per_person=gallery_per_person,
+        class_to_idx=train_dataset.class_to_idx,
+        seed=seed
     )
 
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=config["training"]["batch_size"],
-        shuffle=True,
-        num_workers=config["misc"].get("num_workers", 0)
+        train_dataset, batch_size=int(config['training']['batch_size']),
+        shuffle=True, num_workers=int(config['misc'].get('num_workers', 4)),
+        pin_memory=True, drop_last=True
     )
-
     val_loader = DataLoader(
-        val_dataset,
-        batch_size=config["training"]["batch_size"],
-        shuffle=False,
-        num_workers=config["misc"].get("num_workers", 0)
+        val_dataset, batch_size=int(config['training']['batch_size']),
+        shuffle=False, num_workers=int(config['misc'].get('num_workers', 4)),
+        pin_memory=True
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=int(config['training']['batch_size']),
+        shuffle=False, num_workers=int(config['misc'].get('num_workers', 4)),
+        pin_memory=True
     )
 
-    logger.info(f"Train set size: {len(train_dataset)}")
-    logger.info(f"Val set size: {len(val_dataset)}")
-    logger.info(f"Number of classes: {len(train_dataset.class_to_idx)}")
-
-    # 🔧 【指令C】确认数据对齐绑定
-    logger.info("[Data] ✅ 人脸-指纹数据对齐绑定已确认:")
-    logger.info(f"[Data] - 人脸数据目录: {face_data_dir}")
-    logger.info(f"[Data] - 指纹数据目录: {fingerprint_data_dir}")
-    if train_dataset.samples:
-        sample = train_dataset.samples[0]
-        logger.info(f"[Data] - 配对示例: face={os.path.basename(sample['face_path'])}, "
-                   f"fp={os.path.basename(sample['fingerprint_path'])}, label={sample['label']}")
-
-    # Create models
-    # Load pre-trained face model for feature extraction
-    face_model = create_model(
-        "face",
-        model_type=config["model"].get("face_model_type", "facenet"),
-        num_classes=len(train_dataset.class_to_idx),
-        embedding_dim=config["model"].get("face_embedding_dim", 512),
-        pretrained=config["model"].get("face_pretrained", True),
-        dropout_rate=config["model"].get("dropout_rate", 0.5),
-        spatial_attention=config["model"].get("face_spatial_attention", False)  # 🔧 禁用
-    )
-
-    # Load pre-trained fingerprint model for feature extraction
-    fingerprint_model = create_model(
-        "fingerprint",
-        model_type=config["model"].get("fingerprint_model_type", "fingerprint_net"),
-        num_classes=len(train_dataset.class_to_idx),
-        embedding_dim=config["model"].get("fingerprint_embedding_dim", 256),
-        pretrained=config["model"].get("fingerprint_pretrained", False),
-        dropout_rate=config["model"].get("dropout_rate", 0.5),
-        spatial_attention=config["model"].get("spatial_attention", True)
-    )
-
-    # Create fusion model
-    fusion_model = create_model(
-        "fusion",
-        face_embedding_dim=config["model"].get("face_embedding_dim", 512),
-        fingerprint_embedding_dim=config["model"].get("fingerprint_embedding_dim", 256),
-        num_classes=len(train_dataset.class_to_idx),
-        hidden_dim=config["model"].get("fusion_hidden_dim", 512),
-        dropout_rate=config["model"].get("fusion_dropout_rate", 0.3),
-        fusion_method=args.fusion_method
-    )
-
-    # Count parameters
-    face_params = count_parameters(face_model)[0]
-    fp_params = count_parameters(fingerprint_model)[0]
-    fusion_params = count_parameters(fusion_model)[0]
-
-    logger.info(f"Face model params: {face_params:,}")
-    logger.info(f"Fingerprint model params: {fp_params:,}")
-    logger.info(f"Fusion model params: {fusion_params:,}")
-    logger.info(f"Total trainable params: {face_params + fp_params + fusion_params:,}")
-
-    # Move to device
-    fusion_model = fusion_model.to(device)
-    face_model = face_model.to(device)
-    fingerprint_model = fingerprint_model.to(device)
-
-    # 【指令B】设置ArcFace分类器到FusionModel
     num_classes = len(train_dataset.class_to_idx)
-    face_embedding_dim = config["model"].get("face_embedding_dim", 512)
-    fp_embedding_dim = config["model"].get("fingerprint_embedding_dim", 256)
-    fusion_features_dim = face_embedding_dim + fp_embedding_dim  # 768
+    logger.info(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}, Classes: {num_classes}")
 
-    # 创建ArcFace分类器并设置到FusionModel
-    arc_classifier = ArcMarginProduct(
-        in_features=fusion_features_dim,  # 融合特征维度768
-        out_features=num_classes,
-        s=30.0,
-        m=0.3
+    # 创建单模态模型
+    face_model = create_model(
+        'face', num_classes=num_classes,
+        embedding_dim=int(config['model'].get('face_embedding_dim', 512)),
+        pretrained=True
     ).to(device)
-    fusion_model.arc_classifier = arc_classifier
-    logger.info(f"[Train] ArcFace classifier set: in={fusion_features_dim}, out={num_classes}, s=30.0, m=0.3")
 
-    # 使用CrossEntropyLoss（因为FusionModel内部已集成ArcFace）
-    criterion = nn.CrossEntropyLoss()
+    fp_model = create_model(
+        'fingerprint', num_classes=num_classes,
+        embedding_dim=int(config['model'].get('fingerprint_embedding_dim', 512)),
+        pretrained=True
+    ).to(device)
 
-    # 🔧 【指令B】使用AdamW优化器 + Warmup
-    optimizer_name = config["training"].get("optimizer", "adamw").lower()
-    learning_rate = float(config["training"]["learning_rate"])
-    weight_decay = float(config["training"].get("weight_decay", 1e-2))
+    # 融合模型 (学术标准: 使用 ArcFace s=64, m=0.5)
+    use_arcface = config['model'].get('use_arcface', True)
+    arc_s = float(config['model'].get('arc_s', 64.0))
+    arc_m = float(config['model'].get('arc_m', 0.5))
 
-    if optimizer_name == "adamw":
-        optimizer = optim.AdamW(
-            fusion_model.parameters(),
-            lr=learning_rate,
-            weight_decay=weight_decay
-        )
-        logger.info(f"[Train] 使用 AdamW 优化器, lr={learning_rate}, weight_decay={weight_decay}")
+    fusion_model = create_model(
+        'fusion',
+        fusion_method=args.fusion_method,
+        face_embedding_dim=int(config['model'].get('face_embedding_dim', 512)),
+        fingerprint_embedding_dim=int(config['model'].get('fingerprint_embedding_dim', 512)),
+        num_classes=num_classes,
+        fusion_dim=int(config['model'].get('fusion_dim', 256)),
+        dropout_rate=float(config['model'].get('fusion_dropout_rate', 0.3)),
+        use_arcface=use_arcface,
+        arc_s=arc_s,
+        arc_m=arc_m
+    ).to(device)
+
+    # 统计参数量
+    total_params = sum(p.numel() for p in fusion_model.parameters())
+    trainable = sum(p.numel() for p in fusion_model.parameters() if p.requires_grad)
+    logger.info(f"Fusion model: total={total_params:,}, trainable={trainable:,}")
+
+    # 优化器 - 根据实验模式配置
+    lr = float(config['training']['learning_rate'])
+    wd = float(config['training'].get('weight_decay', 1e-4))
+
+    all_params = list(fusion_model.parameters())
+    if not exp_config['freeze_backbone']:
+        all_params.extend(list(face_model.parameters()))
+        all_params.extend(list(fp_model.parameters()))
+        logger.info("Training: fusion + face + fingerprint backbones")
     else:
-        momentum = float(config["training"].get("momentum", 0.9))
-        optimizer = optim.SGD(
-            fusion_model.parameters(),
-            lr=learning_rate,
-            momentum=momentum,
-            weight_decay=weight_decay
-        )
-        logger.info(f"[Train] 使用 SGD 优化器, lr={learning_rate}, momentum={momentum}")
+        logger.info("Training: fusion only (backbones frozen)")
 
-    # 🔧 【指令B】添加Cosine学习率调度 + Warmup
-    scheduler_type = config["training"].get("scheduler_type", "cosine").lower()
-    warmup_epochs = int(config["training"].get("warmup_epochs", 5))
-    epochs = int(config["training"]["epochs"])
+    optimizer = optim.AdamW(all_params, lr=lr, weight_decay=wd)
 
-    if scheduler_type == "cosine":
-        # Cosine Annealing with Warmup
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=epochs - warmup_epochs,  # 减去warmup期
-            eta_min=1e-6
-        )
-        # 自定义Warmup调度
-        warmup_scheduler = optim.lr_scheduler.LinearLR(
-            optimizer,
-            start_factor=0.1,  # 从10%开始
-            total_iters=warmup_epochs
-        )
-        logger.info(f"[Train] 使用 Cosine调度 + {warmup_epochs}轮 Warmup")
-    else:
-        # StepLR作为fallback
-        step_size = int(config["training"].get("scheduler_step", 20))
-        gamma = float(config["training"].get("scheduler_gamma", 0.1))
-        scheduler = optim.lr_scheduler.StepLR(
-            optimizer,
-            step_size=step_size,
-            gamma=gamma
-        )
-        warmup_scheduler = None
-        logger.info(f"[Train] 使用 StepLR 调度")
+    epochs = int(config['training']['epochs'])
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
-    # Create trainer - pass pretrained checkpoints
-    pretrained_ckpts = {
-        'face': args.face_ckpt,
-        'fingerprint': args.fp_ckpt
-    }
+    criterion = nn.CrossEntropyLoss(label_smoothing=float(config['training'].get('label_smoothing', 0.1)))
 
-    # 🔧 【指令C】解冻策略参数
-    unfreeze_epoch = int(config["training"].get("unfreeze_epoch", 10))
-    face_lr = float(config["training"].get("face_lr", 1e-5))
-    fp_lr = float(config["training"].get("fp_lr", 1e-5))
+    logger.info(f"Optimizer: AdamW, lr={lr}, wd={wd}, epochs={epochs}")
 
-    logger.info(f"[Train] 解冻策略: Epoch {unfreeze_epoch} 后解冻Backbone")
-    logger.info(f"[Train] Backbone学习率: face={face_lr}, fingerprint={fp_lr}")
+    # 预训练权重
+    pretrained_ckpts = None
+    if args.face_ckpt or args.fp_ckpt:
+        pretrained_ckpts = {}
+        if args.face_ckpt:
+            pretrained_ckpts['face'] = args.face_ckpt
+        if args.fp_ckpt:
+            pretrained_ckpts['fingerprint'] = args.fp_ckpt
 
+    # 训练器
     trainer = FusionTrainer(
         fusion_model=fusion_model,
         face_model=face_model,
-        fingerprint_model=fingerprint_model,
+        fingerprint_model=fp_model,
         train_loader=train_loader,
         val_loader=val_loader,
+        test_loader=test_loader,
         optimizer=optimizer,
         scheduler=scheduler,
         criterion=criterion,
         device=device,
         logger=logger,
-        tb_writer=None,
         pretrained_ckpts=pretrained_ckpts,
-        unfreeze_epoch=unfreeze_epoch,
-        face_lr=face_lr,
-        fp_lr=fp_lr
+        freeze_backbone=exp_config['freeze_backbone'],
+        use_amp=config['training'].get('use_amp', True),
+        accumulation_steps=int(config['training'].get('accumulation_steps', 1)),
+        seed=seed,
+        experiment_mode=args.experiment_mode,
+        ablate_modality=exp_config['ablate_modality'],
+        label_smoothing=float(config['training'].get('label_smoothing', 0.1)),
+        tb_writer=writer,
     )
 
-    # 初始化训练历史记录
-    training_history = {
-        "experiment_name": args.experiment_name,
-        "fusion_method": args.fusion_method,
-        "model_type": "fusion",
-        "start_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        "config": config,
-        "epochs": []
+    # 训练循环
+    best_rank1 = 0.0
+    no_improve = 0
+    patience = int(config.get('misc', {}).get('early_stopping_patience', 15))
+
+    history = {
+        'experiment': experiment_name,
+        'experiment_mode': args.experiment_mode,
+        'fusion_method': args.fusion_method,
+        'start_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'epochs': []
     }
 
-    # 获取类别数量用于生物识别指标计算
-    num_classes = len(train_dataset.class_to_idx)
-
-    # Training loop
     start_epoch = 0
-    best_acc = 0.0
-    no_improve_epochs = 0
-    early_stopping = config.get("misc", {}).get("early_stopping", False)
-    early_stopping_patience = int(config.get("misc", {}).get("early_stopping_patience", 5))
-    epochs = int(config["training"]["epochs"])
+    if args.resume:
+        checkpoint = trainer.load_checkpoint(args.resume)
+        start_epoch = checkpoint.get('current_epoch', 0) + 1
+        logger.info(f"Resumed from epoch {start_epoch}")
 
     for epoch in range(start_epoch, epochs):
-        logger.info(f"Epoch {epoch+1}/{epochs}")
-
-        train_loss, train_acc = trainer.train_epoch(epoch)
-        val_loss, val_acc, val_metrics = trainer.validate_epoch(epoch)
-
-        # 计算生物识别指标
-        biometric_results = None
-        if "probabilities" in val_metrics and "labels" in val_metrics:
-            biometric_results = calculate_biometric_metrics(
-                val_metrics["labels"],
-                val_metrics["probabilities"],
-                num_classes=num_classes
-            )
-
+        train_loss, train_acc = trainer.train_epoch(epoch, total_epochs=epochs)
+        val_loss, rank1, val_metrics = trainer.validate_epoch(epoch, total_epochs=epochs)
         scheduler.step()
 
-        # 🔧 【指令B】Warmup调度器处理
-        if warmup_scheduler is not None and epoch < warmup_epochs - 1:
-            warmup_scheduler.step()
-            current_lr = optimizer.param_groups[0]['lr']
-            logger.debug(f"[Warmup] Epoch {epoch+1}: lr = {current_lr:.6f}")
+        history['epochs'].append({
+            'epoch': epoch + 1,
+            'train_loss': train_loss, 'train_acc': train_acc,
+            'val_loss': val_loss, 'val_rank1': rank1,
+            'val_rank5': val_metrics.get('rank_5', 0),
+            'val_rank10': val_metrics.get('rank_10', 0),
+            'val_rank20': val_metrics.get('rank_20', 0),
+            'val_eer': val_metrics.get('eer', 0),
+            'lr': optimizer.param_groups[0]['lr']
+        })
 
-        logger.info(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
-        logger.info(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
-        logger.info(f"Val Precision: {val_metrics['precision']:.4f}, "
-                   f"Recall: {val_metrics['recall']:.4f}, "
-                   f"F1: {val_metrics['f1_score']:.4f}")
-
-        # 记录当前epoch的历史数据
-        epoch_data = {
-            "epoch": epoch + 1,
-            "train_loss": train_loss,
-            "train_acc": train_acc,
-            "val_loss": val_loss,
-            "val_acc": val_acc,
-            "learning_rate": optimizer.param_groups[0]['lr'],
-            "val_metrics": {
-                k: v for k, v in val_metrics.items()
-                if k not in ["predictions", "labels", "probabilities"]  # 不保存大数据
-            }
-        }
-
-        if biometric_results:
-            epoch_data["biometric_metrics"] = {
-                "eer": biometric_results.get("macro_avg", {}).get("eer", 0),
-                "auc": biometric_results.get("macro_avg", {}).get("auc", 0)
-            }
-            # 保存详细的生物识别结果
-            biometric_dir = os.path.join(config["paths"].get("log_dir", "./logs"), args.experiment_name, "biometric_results")
-            os.makedirs(biometric_dir, exist_ok=True)
-            biometric_path = os.path.join(biometric_dir, f"epoch_{epoch+1}_biometric.json")
-            save_biometric_results(biometric_results, biometric_path)
-
-        training_history["epochs"].append(epoch_data)
-
-        # Save best model
-        if val_acc > best_acc:
-            best_acc = val_acc
-            ckpt_dir = config["paths"].get("checkpoint_dir", "./checkpoints")
-            os.makedirs(ckpt_dir, exist_ok=True)
-            ckpt_path = os.path.join(ckpt_dir, f"best_{args.fusion_method}_epoch_{epoch+1}.pth")
-            trainer.save_checkpoint(ckpt_path, is_best=True, extra={"epoch": epoch + 1, "val_acc": val_acc})
-            logger.info(f"[保存] 最佳融合模型: {ckpt_path} (Acc={val_acc:.4f})")
-            no_improve_epochs = 0
+        if rank1 > best_rank1:
+            best_rank1 = rank1
+            trainer.save_checkpoint(os.path.join(ckpt_dir, f"best_{args.fusion_method}.pth"),
+                                  is_best=True,
+                                  extra={'epoch': epoch+1, 'rank1': rank1})
+            no_improve = 0
         else:
-            no_improve_epochs += 1
+            no_improve += 1
 
-        # Early stopping
-        if early_stopping and no_improve_epochs >= early_stopping_patience:
-            logger.info(f"连续{no_improve_epochs}轮无提升 (patience={early_stopping_patience})，触发早停")
+        if no_improve >= patience:
+            logger.info(f"Early stopping at epoch {epoch+1}")
             break
 
-    # 保存完整的训练历史
-    history_dir = os.path.join(config["paths"].get("log_dir", "./logs"), args.experiment_name)
-    os.makedirs(history_dir, exist_ok=True)
-    history_path = os.path.join(history_dir, f"{args.fusion_method}_training_history.json")
+    # 保存历史
+    history_path = os.path.join(log_dir, "history.json")
     with open(history_path, 'w', encoding='utf-8') as f:
-        json.dump(training_history, f, indent=2, ensure_ascii=False, default=str)
+        json.dump(history, f, indent=2, ensure_ascii=False)
 
-    logger.info(f"训练完成! 最佳验证准确率: {best_acc:.4f}")
-    logger.info(f"Training history saved to: {history_path}")
-    # 自动触发可视化（包含序号），非阻塞
-    try:
-        output_dir = config["paths"].get("visualization_dir", "./visualization_results")
-        vis_script = os.path.join(project_root, "scripts", "visualize.py")
-        subprocess.run([sys.executable, vis_script, "--experiment_dir", history_dir, "--output_dir", output_dir, "--include_run_seq"], check=False)
-        logger.info(f"Triggered visualization for {args.experiment_name} -> {output_dir}")
-    except Exception as e:
-        logger.warning(f"Failed to trigger visualization: {e}")
+    logger.info(f"Training complete! Best val Rank-1: {best_rank1:.4f}")
+
+    # ── 测试集评估（仅在训练完成后使用一次）──────────────────────────────
+    if trainer.test_loader is not None:
+        logger.info("=" * 60)
+        logger.info("在测试集上进行最终评估...")
+        logger.info("=" * 60)
+        test_metrics = trainer.test_epoch(epoch=-1, total_epochs=epochs, use_amp=config['training'].get('use_amp', True))
+        if test_metrics and test_metrics.get('rank_1') is not None:
+            logger.info("[测试集] " + " | ".join(
+                f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}"
+                for k, v in [
+                    ("Rank-1", test_metrics.get('rank_1', 0)),
+                    ("Rank-5", test_metrics.get('rank_5', 0)),
+                    ("Rank-10", test_metrics.get('rank_10', 0)),
+                    ("Rank-20", test_metrics.get('rank_20', 0)),
+                    ("EER", test_metrics.get('eer', 0)),
+                ]
+            ))
+        else:
+            logger.info("[测试集] 未检测到测试数据（test_split_ratio=1.0 或测试人员不足）")
 
 
 if __name__ == "__main__":

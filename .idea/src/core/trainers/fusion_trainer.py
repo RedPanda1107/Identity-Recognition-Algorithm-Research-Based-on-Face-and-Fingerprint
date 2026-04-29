@@ -1,510 +1,924 @@
+"""
+融合模型训练器
+支持人脸+指纹多模态训练
+支持消融实验（单模态缺失测试）
+"""
+
 import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from collections import OrderedDict
+from tqdm import tqdm
+from torch.utils.data import DataLoader
+import numpy as np
+from PIL import Image
+from torchvision import transforms
+
 from .base_trainer import BaseTrainer, AverageMeter
 
 
 class FusionTrainer(BaseTrainer):
-    """多模态融合训练器
+    """多模态融合训练器 - 支持完整训练和消融实验
 
-    支持人脸+指纹特征提取和融合训练
-    支持加载预训练的单模态模型权重
+    支持：
+    - 特征级融合（人脸 + 指纹）
+    - ArcFace 度量学习
+    - 开放集检索验证（Gallery/Query）
+    - 单模态 vs 融合对比评估
+    - 消融实验（单模态缺失测试）
     """
 
+    MODALITY = 'fusion'
+
     def __init__(self, fusion_model, face_model, fingerprint_model,
-                 train_loader, val_loader, optimizer, scheduler, criterion,
-                 device, logger, tb_writer=None, pretrained_ckpts=None,
-                 unfreeze_epoch=10, face_lr=1e-5, fp_lr=1e-5):
-        """初始化融合训练器
-
-        Args:
-            pretrained_ckpts: 预训练检查点路径字典
-            unfreeze_epoch: 解冻Backbone的轮次 (默认10轮后解冻)
-            face_lr: 解冻后人脸模型的学习率
-            fp_lr: 解冻后指纹模型的学习率
-        """
-        # 🔧 【指令C】保存解冻策略参数
-        self.unfreeze_epoch = unfreeze_epoch
-        self.face_lr = face_lr
-        self.fp_lr = fp_lr
-        self.current_epoch = 0
-
-        # 初始化父类
-        super(FusionTrainer, self).__init__(
+                 train_loader, val_loader, test_loader=None,
+                 optimizer=None, scheduler=None, criterion=None,
+                 device='cuda', logger=None, pretrained_ckpts=None, freeze_backbone=False,
+                 use_amp=True, accumulation_steps=1, seed=42,
+                 experiment_mode='full', ablate_modality=None,
+                 label_smoothing=0.0, tb_writer=None):
+        super().__init__(
             fusion_model, train_loader, val_loader, optimizer, scheduler,
             criterion, device, logger, tb_writer
         )
 
-        # 存储单模态模型
         self.face_model = face_model.to(device) if face_model else None
         self.fingerprint_model = fingerprint_model.to(device) if fingerprint_model else None
+        self.freeze_backbone = freeze_backbone
+        self.current_epoch = 0
+        self.seed = seed
+        self.experiment_mode = experiment_mode
+        self.ablate_modality = ablate_modality
+        self.label_smoothing = label_smoothing
+        self.test_loader = test_loader
+        self.test_dataset = test_loader.dataset if test_loader else None
+
+        # AMP 配置
+        self.use_amp = use_amp and device.type == 'cuda'
+        self.accumulation_steps = max(1, accumulation_steps)
+        self._scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
+
+        # 带 label_smoothing 的 CrossEntropyLoss（避免每 batch 重建）
+        self._criterion_ls = nn.CrossEntropyLoss(label_smoothing=label_smoothing) \
+            if label_smoothing > 0 else None
+
+        if self.use_amp:
+            self.logger.info(f"[AMP] Mixed precision training enabled (accumulation_steps={self.accumulation_steps})")
+
+        # 实验模式日志
+        self._log_experiment_mode()
 
         # 加载预训练权重
-        if pretrained_ckpts:
-            self._load_pretrained_weights(pretrained_ckpts)
+        self._load_pretrained_weights(pretrained_ckpts)
 
-        # 🔧 【指令A】验证单模态准确率 (最重要的"救命稻草")
-        self._verify_unimodal_accuracy()
+        # 冻结backbone（如需要）
+        if freeze_backbone or experiment_mode == 'fusion_only':
+            self._freeze_feature_extractors()
 
-        # 设置特征提取器为评估模式
-        if self.face_model:
-            self.face_model.eval()
-        if self.fingerprint_model:
-            self.fingerprint_model.eval()
+        # 设置可训练参数
+        self._setup_trainable_params()
 
-        # 冻结特征提取器的参数
-        self._freeze_feature_extractors()
+        # 初始化验证集图像变换
+        self._init_val_transforms()
 
-    def _load_pretrained_weights(self, pretrained_ckpts):
-        """加载预训练的单模态模型权重（带前缀兼容性处理）"""
-        face_loaded = False
-        fp_loaded = False
+        # Gallery 缓存
+        self._gallery_embeddings_cache = None
+        self._gallery_labels_cache = None
+        self._gallery_dirty = True
+        self._last_best_acc = -1.0
 
-        if 'face' in pretrained_ckpts and pretrained_ckpts['face'] and self.face_model:
-            face_ckpt_path = pretrained_ckpts['face']
-            if os.path.exists(face_ckpt_path):
-                try:
-                    ckpt = torch.load(face_ckpt_path, map_location=self.device)
+    def _log_experiment_mode(self):
+        """记录实验模式配置"""
+        mode_descriptions = {
+            'full': '训练全部（backbone + fusion）',
+            'fusion_only': '冻结backbone，只训练融合层',
+            'face_ablation': '消融实验：指纹置零，测试单用人脸',
+            'fingerprint_ablation': '消融实验：人脸置零，测试单用指纹',
+        }
+        desc = mode_descriptions.get(self.experiment_mode, '未知模式')
+        self.logger.info(f"[Experiment] Mode: {self.experiment_mode} - {desc}")
+        if self.ablate_modality:
+            self.logger.info(f"[Ablation] Modality disabled: {self.ablate_modality}")
 
-                    # 获取权重字典
-                    if 'model_state' in ckpt:
-                        state_dict = ckpt['model_state']
-                    else:
-                        state_dict = ckpt
+    def _init_val_transforms(self):
+        """初始化验证时的图像变换（用于Gallery特征提取）"""
+        self.val_face_transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        self.val_fp_transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ])
 
-                    # 打印原始state_dict的key（用于调试）
-                    keys = list(state_dict.keys())
-                    self.logger.info(f"[Face] Checkpoint keys (first 5): {keys[:5]}")
-                    self.logger.info(f"[Face] Model keys (first 5): {list(self.face_model.state_dict().keys())[:5]}")
-
-                    # 处理前缀兼容性问题
-                    state_dict = self._adjust_state_dict_keys(state_dict, self.face_model.state_dict())
-
-                    # 加载权重
-                    self.face_model.load_state_dict(state_dict)
-
-                    # 验证权重加载成功
-                    with torch.no_grad():
-                        test_input = torch.randn(1, 3, 224, 224).to(self.device)
-                        test_feat = self.face_model.extract_features(test_input)
-                        feat_norm = test_feat.norm().item()
-                        self.logger.info(f"[Face] Pretrained weights loaded: {face_ckpt_path}")
-                        self.logger.info(f"[Face] Feature norm: {feat_norm:.4f} (non-zero=success)")
-                    face_loaded = True
-                except Exception as e:
-                    self.logger.warning(f"[Face] Failed to load weights: {e}")
-            else:
-                self.logger.warning(f"[Face] Checkpoint not found: {face_ckpt_path}")
-
-        if 'fingerprint' in pretrained_ckpts and pretrained_ckpts['fingerprint'] and self.fingerprint_model:
-            fp_ckpt_path = pretrained_ckpts['fingerprint']
-            if os.path.exists(fp_ckpt_path):
-                try:
-                    ckpt = torch.load(fp_ckpt_path, map_location=self.device)
-
-                    # 获取权重字典
-                    if 'model_state' in ckpt:
-                        state_dict = ckpt['model_state']
-                    else:
-                        state_dict = ckpt
-
-                    # 打印原始state_dict的key（用于调试）
-                    keys = list(state_dict.keys())
-                    self.logger.info(f"[FP] Checkpoint keys (first 5): {keys[:5]}")
-                    self.logger.info(f"[FP] Model keys (first 5): {list(self.fingerprint_model.state_dict().keys())[:5]}")
-
-                    # 处理前缀兼容性问题
-                    state_dict = self._adjust_state_dict_keys(state_dict, self.fingerprint_model.state_dict())
-
-                    # 加载权重
-                    self.fingerprint_model.load_state_dict(state_dict)
-
-                    # 验证权重加载成功
-                    with torch.no_grad():
-                        test_input = torch.randn(1, 3, 224, 224).to(self.device)
-                        test_feat = self.fingerprint_model.extract_features(test_input)
-                        feat_norm = test_feat.norm().item()
-                        self.logger.info(f"[FP] Pretrained weights loaded: {fp_ckpt_path}")
-                        self.logger.info(f"[FP] Feature norm: {feat_norm:.4f} (non-zero=success)")
-                    fp_loaded = True
-                except Exception as e:
-                    self.logger.warning(f"[FP] Failed to load weights: {e}")
-            else:
-                self.logger.warning(f"[FP] Checkpoint not found: {fp_ckpt_path}")
-
-        # 汇总
-        if face_loaded and fp_loaded:
-            self.logger.info("[OK] Face-Fingerprint alignment: paired samples share labels")
+    def _setup_trainable_params(self):
+        """设置可训练参数"""
+        if self.freeze_backbone or self.experiment_mode == 'fusion_only':
+            for p in self.model.parameters():
+                p.requires_grad = True
+            if self.face_model:
+                for p in self.face_model.parameters():
+                    p.requires_grad = False
+            if self.fingerprint_model:
+                for p in self.fingerprint_model.parameters():
+                    p.requires_grad = False
+            self.logger.info("[Config] Training fusion only (backbones frozen)")
         else:
-            self.logger.warning("[WARN] Using random weights or missing pretrained files")
+            for p in self.model.parameters():
+                p.requires_grad = True
+            if self.face_model:
+                for p in self.face_model.parameters():
+                    p.requires_grad = True
+            if self.fingerprint_model:
+                for p in self.fingerprint_model.parameters():
+                    p.requires_grad = True
+            self.logger.info("[Config] Training fusion + all backbones")
 
-    def _adjust_state_dict_keys(self, state_dict, target_model_dict):
-        """调整state_dict的key前缀，处理model.或backbone.等前缀不匹配问题"""
-        adjusted_state_dict = OrderedDict()
-        target_keys = set(target_model_dict.keys())
-
-        # 尝试直接匹配
-        matched_keys = set(state_dict.keys()) & target_keys
-        if len(matched_keys) / len(target_keys) > 0.5:
-            self.logger.info(f"[Weight] Direct match: {len(matched_keys)}/{len(target_keys)} keys")
-            return state_dict
-
-        # 检查是否需要删除前缀（如 model., backbone.）
-        for key, value in state_dict.items():
-            # 尝试删除常见前缀
-            new_key = key
-            prefixes_to_remove = ['model.', 'backbone.', 'module.']
-            for prefix in prefixes_to_remove:
-                if key.startswith(prefix):
-                    new_key = key[len(prefix):]
-                    break
-
-            # 检查删除前缀后是否匹配
-            if new_key in target_keys:
-                adjusted_state_dict[new_key] = value
-            else:
-                # 尝试添加前缀
-                added_prefix = False
-                for prefix in prefixes_to_remove:
-                    prefixed_key = prefix + key
-                    if prefixed_key in target_keys:
-                        adjusted_state_dict[prefixed_key] = value
-                        added_prefix = True
-                        break
-
-                if not added_prefix:
-                    # 保留原始key（可能有部分层不匹配）
-                    adjusted_state_dict[key] = value
-
-        # 统计匹配情况
-        matched = sum(1 for k in adjusted_state_dict.keys() if k in target_keys)
-        self.logger.info(f"[Weight] Adjusted: {matched}/{len(target_keys)} keys matched")
-        return adjusted_state_dict
-
-    def _verify_unimodal_accuracy(self):
-        """🔧 【指令A】验证单模态准确率 (最重要的"救命稻草")
-
-        在验证集上测试人脸和指纹各自的分类准确率
-        - 加载正确: 应该有合理的准确率 (>20% for 300 classes)
-        - 加载失败: 准确率接近随机 (~0.3% for 300 classes)
-        """
-        self.logger.info("=" * 60)
-        self.logger.info("[验证] 开始验证单模态权重加载...")
-        self.logger.info("=" * 60)
-
-        # 临时创建ArcFace分类器用于测试
-        num_classes = self.model.num_classes if hasattr(self.model, 'num_classes') else 300
-
-        # 验证人脸模型
-        face_acc = self._test_unimodal_accuracy(
-            self.face_model,
-            "人脸",
-            num_classes
-        )
-
-        # 验证指纹模型
-        fp_acc = self._test_unimodal_accuracy(
-            self.fingerprint_model,
-            "指纹",
-            num_classes
-        )
-
-        # 汇总结果
-        self.logger.info("=" * 60)
-        self.logger.info("[FusionTrainer] [STATS] 单模态验证结果汇总:")
-        self.logger.info(f"[FusionTrainer]   人脸模型 Acc: {face_acc*100:.2f}%")
-        self.logger.info(f"[FusionTrainer]   指纹模型 Acc: {fp_acc*100:.2f}%")
-        self.logger.info("=" * 60)
-
-        # 警告
-        if face_acc < 0.05:
-            self.logger.warning("[警告] 人脸模型准确率过低，权重可能未正确加载！")
-        if fp_acc < 0.05:
-            self.logger.warning("[警告] 指纹模型准确率过低，权重可能未正确加载！")
-
-    def _test_unimodal_accuracy(self, model, modality_name, num_classes):
-        """测试单模态模型在验证集上的准确率"""
-        if model is None:
-            self.logger.warning(f"[FusionTrainer] {modality_name}模型不存在")
-            return 0.0
+    def _load_single_modality_weights(self, model, ckpt_path, modality_name):
+        """加载单个模态的预训练权重"""
+        if not model or not os.path.exists(ckpt_path):
+            self.logger.warning(f"[{modality_name}] Checkpoint not found")
+            return False
 
         try:
-            from ..losses.arcface import ArcMarginProduct
+            ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+            state_dict = ckpt.get('model_state', ckpt)
 
-            # 创建ArcFace分类器 (与单模态训练一致)
-            classifier = ArcMarginProduct(
-                in_features=model.embedding_dim if hasattr(model, 'embedding_dim') else 512,
-                out_features=num_classes,
-                s=30.0,
-                m=0.3
-            ).to(self.device)
+            model_state = model.state_dict()
+            matched = {}
+            for k, v in state_dict.items():
+                if k in model_state and model_state[k].shape == v.shape:
+                    matched[k] = v
 
-            # 在验证集上测试
-            correct = 0
-            total = 0
-
-            for batch in self.val_loader:
-                images = batch['face_image' if modality_name == '人脸' else 'fingerprint_image'].to(self.device)
-                labels = batch['label'].to(self.device)
-
-                with torch.no_grad():
-                    # 提取特征
-                    if hasattr(model, 'extract_features'):
-                        features = model.extract_features(images)
-                    else:
-                        features = model._extract_features(images)
-
-                    # 计算logits
-                    logits = classifier(features, labels)
-                    preds = logits.argmax(dim=1)
-
-                    correct += (preds == labels).sum().item()
-                    total += labels.size(0)
-
-            acc = correct / total if total > 0 else 0.0
-            self.logger.info(f"[FusionTrainer] [OK] {modality_name}模型单模态验证完成: Acc={acc*100:.2f}%")
-            return acc
-
+            if matched:
+                model.load_state_dict(matched, strict=False)
+                self.logger.info(f"[{modality_name}] Loaded {len(matched)} params")
+                return True
         except Exception as e:
-            self.logger.warning(f"[FusionTrainer] ❌ {modality_name}模型验证失败: {e}")
-            return 0.0
+            self.logger.warning(f"[{modality_name}] Load failed: {e}")
+        return False
+
+    def _load_pretrained_weights(self, pretrained_ckpts):
+        """加载预训练权重"""
+        if not pretrained_ckpts:
+            return
+
+        if self.face_model and pretrained_ckpts.get('face'):
+            self._load_single_modality_weights(self.face_model, pretrained_ckpts['face'], "Face")
+
+        if self.fingerprint_model and pretrained_ckpts.get('fingerprint'):
+            self._load_single_modality_weights(self.fingerprint_model, pretrained_ckpts['fingerprint'], "FP")
 
     def _freeze_feature_extractors(self):
-        """冻结特征提取器参数"""
+        """冻结特征提取器"""
         if self.face_model:
             for param in self.face_model.parameters():
                 param.requires_grad = False
-            self.logger.info("[冻结] 人脸模型参数已冻结")
         if self.fingerprint_model:
             for param in self.fingerprint_model.parameters():
                 param.requires_grad = False
-            self.logger.info("[冻结] 指纹模型参数已冻结")
 
-    def _unfreeze_backbone_partial(self):
-        """🔧 【指令C】部分解冻Backbone (仅最后两层)
+    def _apply_ablation(self, face_features, fp_features):
+        """应用消融：将指定模态置零"""
+        if self.ablate_modality == 'face':
+            face_features = torch.zeros_like(face_features)
+            self.logger.debug("[Ablation] Face features zeroed out")
+        elif self.ablate_modality == 'fingerprint':
+            fp_features = torch.zeros_like(fp_features)
+            self.logger.debug("[Ablation] Fingerprint features zeroed out")
+        return face_features, fp_features
 
-        解冻人脸ResNet50和指纹ResNet34的最后两层卷积层
-        设置极小的学习率进行联合微调
-        """
-        self.logger.info("=" * 60)
-        self.logger.info(f"[解冻] Epoch {self.current_epoch + 1}: 开始部分解冻Backbone...")
-        self.logger.info("=" * 60)
-
+    def _extract_features_train(self, face_images, fp_images):
+        """训练时提取特征（允许梯度）"""
         if self.face_model:
-            # 解冻ResNet50最后两层 (layer3, layer4)
-            unfrozen_layers = []
-            layer3_unfrozen = False
-            layer4_unfrozen = False
-
-            for name, param in self.face_model.named_parameters():
-                if 'layer3' in name or 'layer4' in name:
-                    param.requires_grad = True
-                    if 'layer3' in name and not layer3_unfrozen:
-                        unfrozen_layers.append('layer3')
-                        layer3_unfrozen = True
-                    elif 'layer4' in name and not layer4_unfrozen:
-                        unfrozen_layers.append('layer4')
-                        layer4_unfrozen = True
-
-            self.logger.info(f"[解冻] 人脸模型解冻层: {unfrozen_layers}")
-
-        if self.fingerprint_model:
-            # 解冻ResNet34最后两层 (layer3, layer4)
-            unfrozen_layers = []
-            layer3_unfrozen = False
-            layer4_unfrozen = False
-
-            for name, param in self.fingerprint_model.named_parameters():
-                if 'layer3' in name or 'layer4' in name:
-                    param.requires_grad = True
-                    if 'layer3' in name and not layer3_unfrozen:
-                        unfrozen_layers.append('layer3')
-                        layer3_unfrozen = True
-                    elif 'layer4' in name and not layer4_unfrozen:
-                        unfrozen_layers.append('layer4')
-                        layer4_unfrozen = True
-
-            self.logger.info(f"[解冻] 指纹模型解冻层: {unfrozen_layers}")
-
-        self.logger.info("[FusionTrainer] [INFO] 请使用更小的学习率微调 (建议: backbone=1e-5, fusion=1e-4)")
-
-    @torch.no_grad()
-    def _extract_features(self, face_images, fingerprint_images):
-        """从两个模态提取特征，包含NaN检查和L2归一化"""
-        # 提取人脸特征
-        if self.face_model:
-            face_features = self.face_model.extract_features(face_images)
+            self.face_model.train()
+            face_features = self.face_model(face_images)
         else:
-            # 如果没有人脸模型，使用随机特征（用于测试）
             face_features = torch.randn(face_images.size(0), 512, device=self.device)
 
-        # 提取指纹特征
         if self.fingerprint_model:
-            fingerprint_features = self.fingerprint_model.extract_features(fingerprint_images)
+            self.fingerprint_model.train()
+            fp_features = self.fingerprint_model(fp_images)
         else:
-            # 如果没有指纹模型，使用随机特征（用于测试）
-            fingerprint_features = torch.randn(fingerprint_images.size(0), 256, device=self.device)
+            fp_features = torch.randn(fp_images.size(0), 512, device=self.device)
 
-        # 🔧 【指令A】强制L2归一化 - 稳定数值分布
-        face_features = F.normalize(face_features, p=2, dim=1)
-        fingerprint_features = F.normalize(fingerprint_features, p=2, dim=1)
+        face_features, fp_features = self._apply_ablation(face_features, fp_features)
 
-        # 🔧 【指令A】NaN/Inf检查
-        if torch.isnan(face_features).any() or torch.isinf(face_features).any():
-            self.logger.warning("[FusionTrainer] 检测到人脸特征包含NaN/Inf，使用零向量替换")
-            face_features = torch.where(
-                torch.isnan(face_features) | torch.isinf(face_features),
-                torch.zeros_like(face_features),
-                face_features
-            )
+        return face_features, fp_features
 
-        if torch.isnan(fingerprint_features).any() or torch.isinf(fingerprint_features).any():
-            self.logger.warning("[FusionTrainer] 检测到指纹特征包含NaN/Inf，使用零向量替换")
-            fingerprint_features = torch.where(
-                torch.isnan(fingerprint_features) | torch.isinf(fingerprint_features),
-                torch.zeros_like(fingerprint_features),
-                fingerprint_features
-            )
-
-        return face_features, fingerprint_features
-
-    def train_epoch(self, epoch):
-        """训练一个epoch"""
-        # 🔧 【指令C】更新当前epoch
-        self.current_epoch = epoch
-
-        # 🔧 【指令C】检查是否需要解冻Backbone
-        if epoch == self.unfreeze_epoch:
-            self._unfreeze_backbone_partial()
-
-        self.model.train()
-        # 特征提取器保持在评估模式（除非已解冻）
+    def _extract_features_eval(self, face_images, fp_images):
+        """验证时提取特征（无梯度）"""
         if self.face_model:
             self.face_model.eval()
+            with torch.no_grad():
+                face_features = self.face_model(face_images)
+        else:
+            face_features = torch.randn(face_images.size(0), 512, device=self.device)
+
         if self.fingerprint_model:
             self.fingerprint_model.eval()
+            with torch.no_grad():
+                fp_features = self.fingerprint_model(fp_images)
+        else:
+            fp_features = torch.randn(fp_images.size(0), 512, device=self.device)
 
+        face_features, fp_features = self._apply_ablation(face_features, fp_features)
+
+        return face_features, fp_features
+
+    def _load_gallery_batch(self, batch_pairs, batch_size):
+        """加载一个Gallery批次的图像并提取特征"""
+        face_imgs = []
+        fp_imgs = []
+
+        for pair in batch_pairs:
+            face_path, fp_path = pair
+            try:
+                face_img = Image.open(face_path).convert('RGB')
+                face_img = self.val_face_transform(face_img)
+                face_imgs.append(face_img)
+            except Exception as e:
+                self.logger.warning(f"[Gallery] Failed to load face: {face_path}, {e}")
+                face_imgs.append(torch.zeros(3, 224, 224))
+
+            try:
+                fp_img = Image.open(fp_path).convert('RGB')
+                fp_img = self.val_fp_transform(fp_img)
+                fp_imgs.append(fp_img)
+            except Exception as e:
+                self.logger.warning(f"[Gallery] Failed to load fingerprint: {fp_path}, {e}")
+                fp_imgs.append(torch.zeros(3, 224, 224))
+
+        face_batch = torch.stack(face_imgs).to(self.device)
+        fp_batch = torch.stack(fp_imgs).to(self.device)
+
+        return face_batch, fp_batch
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # EER 计算工具
+    # ─────────────────────────────────────────────────────────────────────────
+    @staticmethod
+    def calculate_eer(labels, scores):
+        from sklearn.metrics import roc_curve
+        if len(np.unique(labels)) < 2:
+            return 0.0, 0.0
+        fpr, tpr, thresholds = roc_curve(labels, scores, pos_label=1)
+        fnr = 1 - tpr
+        eer_idx = np.nanargmin(np.abs(fpr - fnr))
+        eer = float((fpr[eer_idx] + fnr[eer_idx]) / 2)
+        threshold = float(thresholds[eer_idx])
+        return eer, threshold
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 单步训练
+    # ─────────────────────────────────────────────────────────────────────────
+    def train_step(self, batch, scaler=None, use_amp=False):
+        """单步训练。
+
+        流程：特征提取 → 融合 → 分类 logits → CrossEntropyLoss → AMP backward
+        - NaN 防护：输入/特征/logits/loss 四层检测
+        - AMP：前向 fp16 + loss scale + loss 转 fp32（防 exp 溢出）
+        """
+        face_images = batch['face_image'].to(self.device)
+        fp_images = batch['fingerprint_image'].to(self.device)
+        targets = batch['label'].to(self.device)
+
+        if torch.isnan(face_images).any() or torch.isinf(face_images).any():
+            return None, None, 0.0, "input_nan"
+        if torch.isnan(fp_images).any() or torch.isinf(fp_images).any():
+            return None, None, 0.0, "input_nan"
+
+        if use_amp:
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                face_features, fp_features = self._extract_features_train(face_images, fp_images)
+                if torch.isnan(face_features).any() or torch.isinf(face_features).any():
+                    return None, None, 0.0, "face_feature_nan"
+                if torch.isnan(fp_features).any() or torch.isinf(fp_features).any():
+                    return None, None, 0.0, "fp_feature_nan"
+
+                # 清理残留 NaN
+                face_features = torch.where(torch.isnan(face_features),
+                    torch.zeros_like(face_features), face_features)
+                fp_features = torch.where(torch.isnan(fp_features),
+                    torch.zeros_like(fp_features), fp_features)
+
+                outputs = self.model(face_features, fp_features)
+                if torch.isnan(outputs).any() or torch.isinf(outputs).any():
+                    return None, outputs, 0.0, "logits_nan"
+
+                if self._criterion_ls is not None:
+                    loss = self._criterion_ls(outputs.float(), targets)
+                else:
+                    loss = self.criterion(outputs.float(), targets)
+        else:
+            face_features, fp_features = self._extract_features_train(face_images, fp_images)
+            if torch.isnan(face_features).any() or torch.isinf(face_features).any():
+                return None, None, 0.0, "face_feature_nan"
+            if torch.isnan(fp_features).any() or torch.isinf(fp_features).any():
+                return None, None, 0.0, "fp_feature_nan"
+
+            face_features = torch.where(torch.isnan(face_features),
+                torch.zeros_like(face_features), face_features)
+            fp_features = torch.where(torch.isnan(fp_features),
+                torch.zeros_like(fp_features), fp_features)
+
+            outputs = self.model(face_features, fp_features)
+            if torch.isnan(outputs).any() or torch.isinf(outputs).any():
+                return None, outputs, 0.0, "logits_nan"
+
+            if self._criterion_ls is not None:
+                loss = self._criterion_ls(outputs.float(), targets)
+            else:
+                loss = self.criterion(outputs.float(), targets)
+
+        if torch.isnan(loss):
+            return None, outputs, 0.0, "loss_nan"
+
+        with torch.no_grad():
+            preds = outputs.float().argmax(dim=1)
+            acc = (preds == targets).float().mean().item()
+
+        return loss, outputs, acc, "valid"
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 单轮训练
+    # ─────────────────────────────────────────────────────────────────────────
+    def train_epoch(self, epoch, total_epochs=None, use_amp=False):
+        """训练一轮。
+
+        NaN-safe：遇到 NaN batch 跳过，但继续处理后续 batch。
+        包含特征范数监控（应约等于 1.0）。
+        """
+        self.model.train()
         loss_meter = AverageMeter()
         acc_meter = AverageMeter()
+        feat_norm_meter = AverageMeter()
+        scaler = self._scaler
+        nan_count = 0
+        nan_reasons = {}
 
-        from tqdm import tqdm
-        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1} [Fusion Train]", leave=False)
+        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1} [Train]", leave=False)
 
         for batch_idx, batch in enumerate(pbar):
-            face_images = batch['face_image'].to(self.device)
-            fingerprint_images = batch['fingerprint_image'].to(self.device)
-            targets = batch['label'].to(self.device)
+            result = self.train_step(batch, scaler, use_amp=use_amp)
+            if result[0] is None:
+                nan_count += 1
+                reason = result[3]
+                nan_reasons[reason] = nan_reasons.get(reason, 0) + 1
+                continue
 
-            # 提取两个模态的特征
-            face_features, fingerprint_features = self._extract_features(face_images, fingerprint_images)
+            loss, outputs, acc, _ = result
 
-            # 前向传播通过融合模型 (带labels以启用ArcFace)
-            outputs = self.model(face_features, fingerprint_features, targets)
-            loss = self.criterion(outputs, targets)
-
-            # 反向传播
             self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
-            # 计算准确率
-            preds = outputs.argmax(dim=1)
-            acc = (preds == targets).float().mean().item()
+            # 梯度累积步数到达时更新
+            if (batch_idx + 1) % self.accumulation_steps == 0:
+                if scaler is not None:
+                    scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    scaler.step(self.optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
+                self.optimizer.zero_grad()
 
-            loss_meter.update(loss.item(), face_images.size(0))
-            acc_meter.update(acc, face_images.size(0))
+            batch_size = outputs.size(0)
+            loss_meter.update(loss.item(), batch_size)
+            acc_meter.update(acc, batch_size)
+
+            # 特征范数监控
+            face_images = batch['face_image'].to(self.device)
+            fp_images = batch['fingerprint_image'].to(self.device)
+            with torch.no_grad():
+                face_feat, fp_feat = self._extract_features_eval(face_images, fp_images)
+                fused = self.model.extract_fused_features(face_feat, fp_feat)
+                fused = F.normalize(fused, p=2, dim=1)
+                feat_norm = fused.norm(dim=1).mean().item()
+                if not np.isnan(feat_norm):
+                    feat_norm_meter.update(feat_norm, batch_size)
+
+                if feat_norm < 0.1 or feat_norm > 2.0:
+                    tqdm.write(f"[调试] 特征范数异常: feat_norm={feat_norm:.4f}, 预期约等于1.0")
 
             pbar.set_postfix({"loss": f"{loss_meter.avg:.4f}", "acc": f"{acc_meter.avg:.4f}"})
 
-        self.logger.info(f"[训练] Epoch {epoch+1}: Loss={loss_meter.avg:.4f}, 准确率={acc_meter.avg:.4f}")
+        # 处理剩余未更新的梯度
+        if (batch_idx + 1) % self.accumulation_steps != 0:
+            if scaler is not None:
+                scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                scaler.step(self.optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+            self.optimizer.zero_grad()
+
+        if nan_count > 0:
+            nan_detail = ", ".join(f"{k}={v}" for k, v in nan_reasons.items())
+            self.logger.warning(
+                f"[训练] Epoch {epoch+1}: 共 {nan_count} 个 NaN batch 已跳过 "
+                f"({nan_detail})，有效 batch 数={loss_meter.count}"
+            )
+
+        # 统一日志格式
+        current_lr = self.optimizer.param_groups[0]['lr']
+        gallery_size = len(self.val_loader.dataset.val_gallery_paths) if hasattr(self.val_loader.dataset, 'val_gallery_paths') else None
+        query_size = len(self.val_loader.dataset.val_query_paths) if hasattr(self.val_loader.dataset, 'val_query_paths') else None
+
+        self.log_train_epoch(
+            epoch=epoch + 1,
+            total_epochs=total_epochs,
+            lr=current_lr,
+            loss=loss_meter.avg,
+            acc=acc_meter.avg,
+            gallery_size=gallery_size,
+            query_size=query_size
+        )
+
+        if self.tb_writer:
+            self.tb_writer.add_scalar('train/loss', loss_meter.avg, epoch)
+            self.tb_writer.add_scalar('train/accuracy', acc_meter.avg, epoch)
+            self.tb_writer.add_scalar('train/feature_norm', feat_norm_meter.avg, epoch)
+
         return loss_meter.avg, acc_meter.avg
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # 单轮验证（Gallery/Query 1:N 余弦相似度检索）
+    # ─────────────────────────────────────────────────────────────────────────
     @torch.no_grad()
-    def validate_epoch(self, epoch):
-        """验证一个epoch"""
+    def validate_epoch(self, epoch, total_epochs=50, use_amp=False):
+        """1:N 开集检索验证（Gallery/Query 余弦相似度，完全脱离分类头）。
+
+        流程：
+            1. 提取 Gallery 特征（L2 归一化）
+            2. 提取 Query 特征（L2 归一化）
+            3. 计算余弦相似度矩阵
+            4. 计算 Rank-1/5/10/20 准确率
+            5. 计算 EER（同人匹配 vs 异人拒绝）
+        """
         self.model.eval()
-        if self.face_model:
-            self.face_model.eval()
-        if self.fingerprint_model:
-            self.fingerprint_model.eval()
+        val_dataset = self.val_loader.dataset
 
+        # ── 检查 Gallery/Query 数据是否就绪 ───────────────────────────────
+        if not hasattr(val_dataset, 'val_gallery_paths') or not val_dataset.val_gallery_paths:
+            self.logger.error("[验证] val_gallery_paths 不存在！检查 FusionDataset 是否已更新。")
+            return 0.0, 0.0, {}
+
+        gallery_paths = val_dataset.val_gallery_paths
+        gallery_labels_arr = np.array(val_dataset.val_gallery_labels)
+        batch_size = self.val_loader.batch_size
+
+        # ── 步骤 1：提取 Gallery 特征 ───────────────────────────────────
+        gallery_embeddings_list = []
+        feat_norm_g_meter = AverageMeter()
+
+        self.logger.info("[Gallery] 正在提取特征...")
+        n_gallery_batches = (len(gallery_paths) + batch_size - 1) // batch_size
+        pbar_g = tqdm(total=n_gallery_batches, desc="Gallery", leave=False)
+        for start_idx in range(0, len(gallery_paths), batch_size):
+            end = min(start_idx + batch_size, len(gallery_paths))
+            batch_pairs = gallery_paths[start_idx:end]
+            face_batch, fp_batch = self._load_gallery_batch(batch_pairs, batch_size)
+
+            if use_amp:
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    face_features, fp_features = self._extract_features_eval(face_batch, fp_batch)
+            else:
+                face_features, fp_features = self._extract_features_eval(face_batch, fp_batch)
+
+            fused_features = self.model.extract_fused_features(face_features, fp_features)
+            fused_features = F.normalize(fused_features, p=2, dim=1)
+
+            feat_norm = fused_features.norm(dim=1).mean().item()
+            if not np.isnan(feat_norm):
+                feat_norm_g_meter.update(feat_norm, fused_features.size(0))
+
+            gallery_embeddings_list.append(fused_features.cpu())
+            pbar_g.update()
+        pbar_g.close()
+
+        if not gallery_embeddings_list:
+            self.logger.error("[验证] Gallery 特征为空！")
+            return 0.0, 0.0, {}
+
+        gallery_embeddings = torch.cat(gallery_embeddings_list, dim=0)  # [G, fusion_dim]
+        self.logger.info(
+            f"[Gallery] {len(gallery_paths)} 对（验证集 {len(np.unique(gallery_labels_arr))} 人）"
+        )
+
+        # ── 步骤 2：提取 Query 特征 ─────────────────────────────────────
+        query_embeddings_list = []
+        query_labels_list = []
+        feat_norm_q_meter = AverageMeter()
         loss_meter = AverageMeter()
-        acc_meter = AverageMeter()
 
-        from tqdm import tqdm
-        pbar = tqdm(self.val_loader, desc=f"Epoch {epoch+1} [Fusion Val]", leave=False)
-
-        all_preds = []
-        all_labels = []
-
-        for batch in pbar:
+        self.logger.info("[验证] 正在提取 Query 特征...")
+        pbar_q = tqdm(self.val_loader, desc=f"Epoch {epoch+1} [Val]", leave=False)
+        for batch in pbar_q:
             face_images = batch['face_image'].to(self.device)
-            fingerprint_images = batch['fingerprint_image'].to(self.device)
-            targets = batch['label'].to(self.device)
+            fp_images = batch['fingerprint_image'].to(self.device)
+            targets = batch['label']
 
-            # 提取特征
-            face_features, fingerprint_features = self._extract_features(face_images, fingerprint_images)
+            if use_amp:
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    face_features, fp_features = self._extract_features_eval(face_images, fp_images)
+            else:
+                face_features, fp_features = self._extract_features_eval(face_images, fp_images)
 
-            # 前向传播 (带labels以启用ArcFace)
-            outputs = self.model(face_features, fingerprint_features, targets)
-            loss = self.criterion(outputs, targets)
+            fused_features = self.model.extract_fused_features(face_features, fp_features)
+            fused_features_q = F.normalize(fused_features, p=2, dim=1)
 
-            # 计算准确率
-            preds = outputs.argmax(dim=1)
-            acc = (preds == targets).float().mean().item()
+            feat_norm = fused_features_q.norm(dim=1).mean().item()
+            if not np.isnan(feat_norm):
+                feat_norm_q_meter.update(feat_norm, face_images.size(0))
 
-            loss_meter.update(loss.item(), face_images.size(0))
-            acc_meter.update(acc, face_images.size(0))
+            query_embeddings_list.append(fused_features_q.cpu())
+            query_labels_list.extend(targets.tolist())
 
-            all_preds.extend(preds.cpu().tolist())
-            all_labels.extend(targets.cpu().tolist())
+            # 计算分类 loss（仅用于监控，与检索指标无关）
+            with torch.no_grad():
+                outputs = self.model(face_features, fp_features)
+                if self._criterion_ls is not None:
+                    l = self._criterion_ls(outputs.float(), targets.to(self.device))
+                else:
+                    l = self.criterion(outputs.float(), targets.to(self.device))
+                if not torch.isnan(l):
+                    loss_meter.update(l.item(), face_images.size(0))
 
-            pbar.set_postfix({"loss": f"{loss_meter.avg:.4f}", "acc": f"{acc_meter.avg:.4f}"})
+        if not query_embeddings_list:
+            self.logger.error("[验证] 没有 Query 样本！")
+            return 0.0, 0.0, {}
 
-        # 计算详细指标
+        query_embeddings = torch.cat(query_embeddings_list, dim=0)  # [Q, fusion_dim]
+        query_labels = np.array(query_labels_list)
+
+        if torch.isnan(query_embeddings).any() or torch.isnan(gallery_embeddings).any():
+            self.logger.error("[验证] 特征包含 NaN！模型特征提取器崩溃。")
+            return float('nan'), 0.0, {"feature_norm": 0.0}
+
+        self.logger.info(
+            f"[验证] Query: {len(query_labels)} 样本, "
+            f"{len(np.unique(query_labels))} 个验证人, "
+            f"特征范数={feat_norm_q_meter.avg:.4f}"
+        )
+
+        # ── 步骤 3：计算余弦相似度矩阵 ────────────────────────────────
+        self.logger.info("[验证] 正在计算相似度矩阵...")
+        similarity_matrix = torch.mm(query_embeddings, gallery_embeddings.t())  # [Q, G]
+
+        # ── 步骤 4：Rank-K 准确率 ────────────────────────────────────
+        top_k = min(20, gallery_embeddings.size(0))
+        _, top_k_indices = torch.topk(similarity_matrix, k=top_k, dim=1)
+        top_k_indices = top_k_indices.numpy()
+        top_k_labels = gallery_labels_arr[top_k_indices]
+
+        rank_metrics = {}
+        for k in [1, 5, 10, 20]:
+            if k <= top_k:
+                correct = sum(
+                    1 for i in range(len(query_labels))
+                    if query_labels[i] in top_k_labels[i, :k]
+                )
+                rank_metrics[f"rank_{k}"] = correct / len(query_labels)
+
+        rank1_acc = rank_metrics.get("rank_1", 0.0)
+        rank5_acc = rank_metrics.get("rank_5", 0.0)
+        rank10_acc = rank_metrics.get("rank_10", 0.0)
+        rank20_acc = rank_metrics.get("rank_20", 0.0)
+
+        # ── 步骤 5：EER（同人匹配 vs 异人拒绝）─────────────────────
+        eer = 0.0
         try:
-            from sklearn.metrics import precision_score, recall_score, f1_score
-            precision = precision_score(all_labels, all_preds, average='macro', zero_division=0)
-            recall = recall_score(all_labels, all_preds, average='macro', zero_division=0)
-            f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
-        except Exception:
-            precision = recall = f1 = 0.0
+            positive_scores = []
+            negative_scores = []
+            rng = np.random.RandomState(self.seed)
 
-        metrics = {"precision": precision, "recall": recall, "f1_score": f1}
-        self.logger.info(f"[验证] Epoch {epoch+1}: Loss={loss_meter.avg:.4f}, 准确率={acc_meter.avg:.4f}, 精确率={precision:.4f}, 召回率={recall:.4f}, F1={f1:.4f}")
-        return loss_meter.avg, acc_meter.avg, metrics
+            for q_idx in range(len(query_labels)):
+                q_label = query_labels[q_idx]
+                q_emb = query_embeddings[q_idx]
 
-    def save_checkpoint(self, path, is_best=False, extra=None):
-        """保存检查点（仅最佳模型）"""
-        checkpoint = {
-            'fusion_model': self.model.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-            'scheduler': self.scheduler.state_dict() if self.scheduler else None,
+                same_idx = np.where(gallery_labels_arr == q_label)[0]
+                if len(same_idx) > 0:
+                    sims = (q_emb @ gallery_embeddings[same_idx].t()).numpy()
+                    topk_k = min(5, len(sims))
+                    vals = np.sort(sims)[-topk_k:]
+                    positive_scores.extend(vals.tolist())
+
+                diff_idx = np.where(gallery_labels_arr != q_label)[0]
+                if len(diff_idx) > 0:
+                    n_neg = min(3, len(diff_idx))
+                    selected = rng.choice(diff_idx, n_neg, replace=False)
+                    sims = (q_emb @ gallery_embeddings[selected].t()).numpy()
+                    negative_scores.extend(sims.tolist())
+
+            n_pos, n_neg = len(positive_scores), len(negative_scores)
+            if n_pos >= 50 and n_neg >= 50:
+                scores = np.array(positive_scores + negative_scores)
+                eer_labels = np.array([1] * n_pos + [0] * n_neg)
+                eer, eer_th = self.calculate_eer(eer_labels, scores)
+                self.logger.info(
+                    f"[EER] 正样本={n_pos}, 负样本={n_neg}, "
+                    f"EER={eer:.4f} (阈值={eer_th:.4f})"
+                )
+            else:
+                self.logger.warning(
+                    f"[EER] 样本不足（正={n_pos}/需50，负={n_neg}/需50），跳过 EER"
+                )
+        except Exception as e:
+            self.logger.warning(f"[EER计算] 失败: {e}")
+
+        # ── 步骤 6：汇总指标 ─────────────────────────────────────
+        metrics = {
+            "rank_1": rank1_acc,
+            "rank_5": rank5_acc,
+            "rank_10": rank10_acc,
+            "rank_20": rank20_acc,
+            "eer": eer,
+            "feature_norm_gallery": feat_norm_g_meter.avg,
+            "feature_norm_query": feat_norm_q_meter.avg,
+            "query_count": len(query_labels),
+            "gallery_count": len(gallery_paths),
+            "gallery_persons": int(len(np.unique(gallery_labels_arr))),
+            "query_persons": int(len(np.unique(query_labels))),
         }
 
-        if extra:
-            checkpoint.update(extra)
+        # 统一日志格式
+        current_lr = self.optimizer.param_groups[0]['lr']
+        self.log_val_epoch(
+            epoch=epoch + 1,
+            total_epochs=total_epochs,
+            lr=current_lr,
+            loss=loss_meter.avg,
+            rank1=rank1_acc,
+            eer=eer if not np.isnan(eer) else None,
+            gallery_size=len(gallery_paths),
+            query_size=len(query_labels)
+        )
 
-        # 只保存最佳模型
-        if is_best:
-            torch.save(checkpoint, path)
-            self.logger.info(f"[保存] 最佳模型: {path}")
-        else:
-            # 临时保存Latest用于恢复训练
-            latest_path = path.replace(".pth", "_latest.pth")
-            torch.save(checkpoint, latest_path)
+        # 详细指标日志
+        self.logger.info(
+            f"[Metrics] Rank-1: {rank1_acc:.4f} | Rank-5: {rank5_acc:.4f} | "
+            f"Rank-10: {rank10_acc:.4f} | Rank-20: {rank20_acc:.4f} | EER: {eer:.4f}"
+        )
+
+        # 打印样本匹配详情（按人均匀抽取前 5 个不同人的样本）
+        unique_persons = np.unique(query_labels)
+        selected_persons = unique_persons[:min(5, len(unique_persons))]
+        sample_indices = [np.where(query_labels == p)[0][0] for p in selected_persons]
+        self.logger.info("[验证样本] Query vs Top-3 Gallery 匹配（按人均匀抽取前 5 人）:")
+        for idx in sample_indices:
+            true_label = query_labels[idx]
+            top3_pred_labels = top_k_labels[idx, :3]
+            top3_sims = similarity_matrix[idx, top_k_indices[idx, :3]].numpy()
+            match_str = "[O]" if true_label == top3_pred_labels[0] else "[X]"
+            top3_str = ", ".join(
+                f"{l}({s:.3f})" for l, s in zip(top3_pred_labels, top3_sims)
+            )
+            self.logger.info(f"  Query同人={true_label}, Top3预测=[{top3_str}] {match_str}")
+
+        if self.tb_writer:
+            self.tb_writer.add_scalar('val/rank_1', rank1_acc, epoch)
+            self.tb_writer.add_scalar('val/rank_5', rank5_acc, epoch)
+            self.tb_writer.add_scalar('val/rank_10', rank10_acc, epoch)
+            self.tb_writer.add_scalar('val/rank_20', rank20_acc, epoch)
+            self.tb_writer.add_scalar('val/eer', eer, epoch)
+            self.tb_writer.add_scalar('val/feature_norm_query', feat_norm_q_meter.avg, epoch)
+
+        return loss_meter.avg, rank1_acc, metrics
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 测试集评估
+    # ─────────────────────────────────────────────────────────────────────────
+    @torch.no_grad()
+    def test_epoch(self, epoch=None, total_epochs=None, use_amp=False):
+        """在测试集上进行评估（与 validate_epoch 逻辑相同，但使用测试集）。"""
+        self.model.eval()
+
+        test_dataset = getattr(self, 'test_dataset', None)
+        if test_dataset is None:
+            self.logger.warning("[测试] 测试集未设置，跳过测试评估。")
+            return {"rank_1": None, "rank_5": None, "rank_10": None, "rank_20": None, "eer": None}
+
+        if not hasattr(test_dataset, 'test_gallery_paths') or not test_dataset.test_gallery_paths:
+            self.logger.warning("[测试] 测试集不存在，跳过测试评估。")
+            return {"rank_1": None, "rank_5": None, "rank_10": None, "rank_20": None, "eer": None}
+
+        gallery_paths = test_dataset.test_gallery_paths
+        gallery_labels_arr = np.array(test_dataset.test_gallery_labels)
+        batch_size = self.val_loader.batch_size
+
+        # ── Gallery ──────────────────────────────────────────────────────
+        gallery_embeddings_list = []
+        feat_norm_g_meter = AverageMeter()
+
+        self.logger.info("[Test Gallery] 正在提取特征...")
+        n_gallery_batches = (len(gallery_paths) + batch_size - 1) // batch_size
+        pbar_g = tqdm(total=n_gallery_batches, desc="Test Gallery", leave=False)
+        for start_idx in range(0, len(gallery_paths), batch_size):
+            end = min(start_idx + batch_size, len(gallery_paths))
+            batch_pairs = gallery_paths[start_idx:end]
+            face_batch, fp_batch = self._load_gallery_batch(batch_pairs, batch_size)
+
+            if use_amp:
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    face_features, fp_features = self._extract_features_eval(face_batch, fp_batch)
+            else:
+                face_features, fp_features = self._extract_features_eval(face_batch, fp_batch)
+
+            fused_features = self.model.extract_fused_features(face_features, fp_features)
+            fused_features = F.normalize(fused_features, p=2, dim=1)
+
+            feat_norm = fused_features.norm(dim=1).mean().item()
+            if not np.isnan(feat_norm):
+                feat_norm_g_meter.update(feat_norm, fused_features.size(0))
+            gallery_embeddings_list.append(fused_features.cpu())
+            pbar_g.update()
+        pbar_g.close()
+
+        gallery_embeddings = torch.cat(gallery_embeddings_list, dim=0)
+        self.logger.info(
+            f"[Test Gallery] {len(gallery_paths)} 对（测试集 {len(np.unique(gallery_labels_arr))} 人）"
+        )
+
+        # ── Query ─────────────────────────────────────────────────────────
+        test_loader = DataLoader(
+            test_dataset, batch_size=batch_size, shuffle=False,
+            num_workers=0, pin_memory=True, drop_last=False
+        )
+
+        query_embeddings_list = []
+        query_labels_list = []
+        feat_norm_q_meter = AverageMeter()
+
+        self.logger.info("[测试] 正在提取 Query 特征...")
+        pbar_q = tqdm(test_loader, desc="Test Query", leave=False)
+        for batch in pbar_q:
+            face_images = batch['face_image'].to(self.device)
+            fp_images = batch['fingerprint_image'].to(self.device)
+
+            if use_amp:
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    face_features, fp_features = self._extract_features_eval(face_images, fp_images)
+            else:
+                face_features, fp_features = self._extract_features_eval(face_images, fp_images)
+
+            fused_features = self.model.extract_fused_features(face_features, fp_features)
+            fused_features_q = F.normalize(fused_features, p=2, dim=1)
+
+            feat_norm = fused_features_q.norm(dim=1).mean().item()
+            if not np.isnan(feat_norm):
+                feat_norm_q_meter.update(feat_norm, face_images.size(0))
+
+            query_embeddings_list.append(fused_features_q.cpu())
+            query_labels_list.extend(batch['label'].tolist())
+
+        if not query_embeddings_list:
+            self.logger.error("[测试] 没有 Query 样本！")
+            return {"rank_1": None, "rank_5": None, "rank_10": None, "rank_20": None, "eer": None}
+
+        query_embeddings = torch.cat(query_embeddings_list, dim=0)
+        query_labels = np.array(query_labels_list)
+
+        self.logger.info(
+            f"[测试] Query: {len(query_labels)} 样本, "
+            f"{len(np.unique(query_labels))} 个测试人"
+        )
+
+        # ── 相似度 & 指标 ────────────────────────────────────────────────
+        self.logger.info("[测试] 正在计算相似度矩阵...")
+        similarity_matrix = torch.mm(query_embeddings, gallery_embeddings.t())
+
+        top_k = min(20, gallery_embeddings.size(0))
+        _, top_k_indices = torch.topk(similarity_matrix, k=top_k, dim=1)
+        top_k_indices = top_k_indices.numpy()
+        top_k_labels = gallery_labels_arr[top_k_indices]
+
+        rank_metrics = {}
+        for k in [1, 5, 10, 20]:
+            if k <= top_k:
+                correct = sum(
+                    1 for i in range(len(query_labels))
+                    if query_labels[i] in top_k_labels[i, :k]
+                )
+                rank_metrics[f"rank_{k}"] = correct / len(query_labels)
+
+        rank1_acc = rank_metrics.get("rank_1", 0.0)
+        rank5_acc = rank_metrics.get("rank_5", 0.0)
+        rank10_acc = rank_metrics.get("rank_10", 0.0)
+        rank20_acc = rank_metrics.get("rank_20", 0.0)
+
+        eer = 0.0
+        try:
+            positive_scores, negative_scores = [], []
+            rng = np.random.RandomState(self.seed)
+            for q_idx in range(len(query_labels)):
+                q_label = query_labels[q_idx]
+                q_emb = query_embeddings[q_idx]
+                same_idx = np.where(gallery_labels_arr == q_label)[0]
+                if len(same_idx) > 0:
+                    sims = (q_emb @ gallery_embeddings[same_idx].t()).numpy()
+                    topk_k = min(5, len(sims))
+                    positive_scores.extend(np.sort(sims)[-topk_k:].tolist())
+                diff_idx = np.where(gallery_labels_arr != q_label)[0]
+                if len(diff_idx) > 0:
+                    n_neg = min(3, len(diff_idx))
+                    selected = rng.choice(diff_idx, n_neg, replace=False)
+                    sims = (q_emb @ gallery_embeddings[selected].t()).numpy()
+                    negative_scores.extend(sims.tolist())
+
+            n_pos, n_neg = len(positive_scores), len(negative_scores)
+            if n_pos >= 50 and n_neg >= 50:
+                scores = np.array(positive_scores + negative_scores)
+                eer_labels = np.array([1] * n_pos + [0] * n_neg)
+                eer, eer_th = self.calculate_eer(eer_labels, scores)
+                self.logger.info(
+                    f"[Test EER] 正样本={n_pos}, 负样本={n_neg}, "
+                    f"EER={eer:.4f} (阈值={eer_th:.4f})"
+                )
+        except Exception as e:
+            self.logger.warning(f"[Test EER计算] 失败: {e}")
+
+        # ── 测试结果汇总 ────────────────────────────────────────────────
+        metrics = {
+            "rank_1": rank1_acc, "rank_5": rank5_acc,
+            "rank_10": rank10_acc, "rank_20": rank20_acc,
+            "eer": eer, "feature_norm_gallery": feat_norm_g_meter.avg,
+            "feature_norm_query": feat_norm_q_meter.avg,
+            "query_count": len(query_labels),
+            "gallery_count": len(gallery_paths),
+            "gallery_persons": int(len(np.unique(gallery_labels_arr))),
+            "query_persons": int(len(np.unique(query_labels))),
+        }
+
+        self.logger.info("=" * 60)
+        self.logger.info("【测试集评估】")
+        self.logger.info(f"  Rank-1:  {rank1_acc:.4f} ({int(rank1_acc * len(query_labels))}/{len(query_labels)})")
+        self.logger.info(f"  Rank-5:  {rank5_acc:.4f}")
+        self.logger.info(f"  Rank-10: {rank10_acc:.4f}")
+        self.logger.info(f"  Rank-20: {rank20_acc:.4f}")
+        self.logger.info(f"  EER:     {eer:.4f}" if eer > 0 else "  EER:     N/A")
+        self.logger.info(f"  Gallery: {len(gallery_paths)} 对 / {len(np.unique(gallery_labels_arr))} 人")
+        self.logger.info(f"  Query:   {len(query_labels)} 样本 / {len(np.unique(query_labels))} 人")
+        self.logger.info("=" * 60)
+
+        # 样本匹配详情（按人均匀抽取）
+        unique_persons = np.unique(query_labels)
+        selected_persons = unique_persons[:min(5, len(unique_persons))]
+        sample_indices = [np.where(query_labels == p)[0][0] for p in selected_persons]
+        self.logger.info("[测试样本] Query vs Top-3 Gallery 匹配（按人均匀抽取前 5 人）:")
+        for idx in sample_indices:
+            true_label = query_labels[idx]
+            top3_pred_labels = top_k_labels[idx, :3]
+            top3_sims = similarity_matrix[idx, top_k_indices[idx, :3]].numpy()
+            match_str = "[O]" if true_label == top3_pred_labels[0] else "[X]"
+            top3_str = ", ".join(f"{l}({s:.3f})" for l, s in zip(top3_pred_labels, top3_sims))
+            self.logger.info(f"  Query同人={true_label}, Top3预测=[{top3_str}] {match_str}")
+
+        return metrics
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 保存检查点
+    # ─────────────────────────────────────────────────────────────────────────
+    def save_checkpoint(self, path, epoch=None, is_best=False, extra=None):
+        """保存检查点"""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+        state = {
+            "model_state": self.model.state_dict(),
+            "optimizer_state": self.optimizer.state_dict(),
+            "scheduler_state": self.scheduler.state_dict() if self.scheduler else None,
+            "epoch": epoch or 0,
+        }
+        if self.face_model:
+            state["face_model_state"] = self.face_model.state_dict()
+        if self.fingerprint_model:
+            state["fp_model_state"] = self.fingerprint_model.state_dict()
+        if extra:
+            state.update(extra)
+
+        torch.save(state, path)
+        self.logger.info(f"[保存] Checkpoint: {path}" if not is_best else f"[保存] 最佳模型: {path}")
+        return path
 
     def load_checkpoint(self, path):
         """加载检查点"""
-        checkpoint = torch.load(path, map_location=self.device)
-
-        self.model.load_state_dict(checkpoint['fusion_model'])
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        self.model.load_state_dict(checkpoint['model_state'])
+        if checkpoint.get('face_model_state') and self.face_model:
+            self.face_model.load_state_dict(checkpoint['face_model_state'])
+        if checkpoint.get('fp_model_state') and self.fingerprint_model:
+            self.fingerprint_model.load_state_dict(checkpoint['fp_model_state'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
-
-        if self.scheduler and checkpoint.get('scheduler'):
-            self.scheduler.load_state_dict(checkpoint['scheduler'])
-
-        self.logger.info(f"加载融合模型检查点: {path}")
+        if self.scheduler and checkpoint.get('scheduler_state'):
+            self.scheduler.load_state_dict(checkpoint['scheduler_state'])
+        self.current_epoch = checkpoint.get('epoch', 0)
+        self.logger.info(f"[Load] Checkpoint: {path}")
         return checkpoint

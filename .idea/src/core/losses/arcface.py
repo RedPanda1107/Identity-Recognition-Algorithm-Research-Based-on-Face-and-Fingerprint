@@ -5,17 +5,30 @@ import torch.nn.functional as F
 
 
 class ArcMarginProduct(nn.Module):
-    """
-    Implement of large margin arc distance:
+    """ArcFace margin product for metric learning.
+
+    Standard academic configuration: s=64.0, m=0.5
+    - s: Scale factor (controls the hardness of softmax)
+    - m: Angular margin penalty (pushes embeddings of different classes apart)
+
+    Reference: ArcFace: Additive Angular Margin Loss for Deep Face Recognition
+              (InsightFace, CVPR 2019)
+
     Args:
         in_features: size of each input sample (embedding dim)
         out_features: number of classes
-        s: norm of input feature
-        m: margin
+        s: norm of input feature (default: 64.0)
+        m: margin (default: 0.5)
         easy_margin: whether to use easy margin
     """
-    def __init__(self, in_features, out_features, s=30.0, m=0.50, easy_margin=False):
+    def __init__(self, in_features, out_features, s=64.0, m=0.5, easy_margin=False):
         super(ArcMarginProduct, self).__init__()
+        # Parameter validation
+        if s <= 0:
+            raise ValueError(f"Scale factor s must be positive, got {s}")
+        if m < 0 or m > 1:
+            raise ValueError(f"Margin m must be in [0, 1], got {m}")
+
         self.in_features = in_features
         self.out_features = out_features
         self.s = s
@@ -29,12 +42,20 @@ class ArcMarginProduct(nn.Module):
         self.mm = math.sin(math.pi - m) * m
         self.easy_margin = easy_margin
 
-    def forward(self, input, label):
+    def forward(self, input, label=None):
         # input is features: (batch_size, embedding_dim)
-        # label is (batch_size,)
-        # normalize features and weights
+        # label is (batch_size,) - optional, if None, return raw cosine similarity
         cosine = F.linear(F.normalize(input), F.normalize(self.weight))  # [bs, out_features]
-        sine = torch.sqrt(1.0 - torch.pow(torch.clamp(cosine, min=0.0, max=1.0), 2))
+
+        # If no label provided, return raw cosine similarity (m=0 state)
+        if label is None:
+            return cosine * self.s
+
+        # Compute sine with numerical stability: clamp to prevent sqrt of negative
+        cosine_clamped = torch.clamp(cosine, min=-1.0 + 1e-7, max=1.0 - 1e-7)
+        sine = torch.sqrt(torch.clamp(1.0 - cosine_clamped.pow(2), min=0.0))
+
+        # Apply ArcFace margin
         phi = cosine * self.cos_m - sine * self.sin_m
 
         if self.easy_margin:

@@ -1,0 +1,35 @@
+# ============================================================
+# 统一配置 - 多模态人脸+指纹融合研究
+# ============================================================
+# 此文件定义所有模态共享的参数
+# 各模态配置文件应从本文件继承共享参数
+# ============================================================
+
+shared:
+  # 数据划分参数
+  split_ratio: 0.8          # Person-wise 划分比例 (80% 训练, 20% 验证)
+  random_seed: 42            # 统一随机种子 (保证结果可复现)
+  gallery_per_person: 3      # 验证集 Gallery 每人的图片数
+
+  # ArcFace 参数 (学术标准配置)
+  arcface:
+    s: 64.0                  # Scale factor (s=64 增强类间区分度)
+    m: 0.5                   # Angular margin penalty
+    m_start: 0.0             # Margin 起始值 (支持 warmup)
+    m_end: 0.5               # Margin 最终值
+    m_warmup_epochs: 10      # Margin 爬坡轮次
+    m_delay_epochs: 10       # Margin 延迟激活轮次
+
+  # 特征参数
+  embedding_dim: 512         # 特征维度 (统一 512 维)
+  feature_normalize: true    # L2 归一化
+
+  # 评估参数
+  evaluation:
+    rank_k: [1, 5, 10, 20]  # Rank-K 指标
+    compute_eer: true        # 计算 EER
+    eer_sample_negatives: 3   # EER 计算时每人采样负样本数
+    tta: true                # 测试时增强 (水平翻转)
+
+  # 日志格式 (统一输出格式)
+  log_format: "[{timestamp}] phase={phase} modality={modality} epoch={epoch}/{total} lr={lr:.1e} loss={loss:.4f} acc={acc} rank1={rank1} eer={eer} gallery={gallery} query={query}"

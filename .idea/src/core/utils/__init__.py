@@ -15,10 +15,11 @@ from .utils import (
     plot_det_curves,
     plot_far_frr_curves,
     save_results_to_json,
-    AverageMeter,
+    compute_classification_metrics,
     TensorBoardWriter,
     create_data_splits
 )
+from .logger import TrainingLogger
 
 __all__ = [
     "load_config",
@@ -36,7 +37,8 @@ __all__ = [
     "plot_det_curves",
     "plot_far_frr_curves",
     "save_results_to_json",
-    "AverageMeter",
+    "compute_classification_metrics",
     "TensorBoardWriter",
-    "create_data_splits"
+    "create_data_splits",
+    "TrainingLogger"
 ]
