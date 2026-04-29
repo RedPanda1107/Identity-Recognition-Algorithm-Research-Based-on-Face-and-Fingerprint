@@ -25,7 +25,6 @@
 │   ├── loss.py           # 损失函数
 │   └── utils.py          # 工具函数
 ├── scripts/               # 脚本工具
-├── logs/                  # 训练日志
 ├── train.py              # 训练入口
 ├── test.py               # 测试入口
 └── requirements.txt      # 依赖包

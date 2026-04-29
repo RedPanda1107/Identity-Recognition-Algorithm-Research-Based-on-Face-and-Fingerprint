@@ -17,14 +17,12 @@
 | `bind_face_fingerprint_ids.py` | 完整数据绑定（全部人） |
 | `bind_fusion_data.py` | 融合实验数据绑定（限定300人） |
 | `verify_binding.py` | 验证数据绑定结果 |
-| `import_socofing.py` | 导入SOCOFing指纹数据集 |
 
 ## 子目录
 
 | 目录 | 说明 |
 |------|------|
 | `checkpoints/` | 模型检查点 |
-| `logs/` | 训练日志 |
 | `visualization_results/` | 可视化结果 |
 
 ---

@@ -10,11 +10,6 @@ scripts/
 │       ├── last_model.pth         # 最后一次保存的模型
 │       └── epoch_10_model.pth     # 第10轮的模型
 │
-├── 📁 logs/                  # 训练日志
-│   └── face_recognition/
-│       ├── training.log            # 训练过程日志
-│       └── events.out.tfevents     # TensorBoard 日志（图表用）
-│
 └── 📁 visualization_results/  # 可视化结果
     └── face_recognition/
         ├── accuracy_curve.png      # 准确率曲线
@@ -48,25 +43,7 @@ scripts/
 
 ---
 
-### 2. logs/ 训练日志
-
-| 文件 | 作用 | 查看方式 |
-|------|------|---------|
-| `training.log` | 文字日志 | 直接打开查看 |
-| `events.out.tfevents` | TensorBoard数据 | 用 `tensorboard --logdir logs` 查看 |
-
-**training.log 示例：**
-```
-2026-02-08 10:30:15 - Epoch 1/50
-2026-02-08 10:30:16 - Train Loss: 0.85, Train Acc: 0.65
-2026-02-08 10:30:20 - Val Loss: 0.45, Val Acc: 0.85
-2026-02-08 10:30:21 - Saved best model: best_model.pth (Acc: 0.85)
-...
-```
-
----
-
-### 3. visualization_results/ 可视化图表
+### 2. visualization_results/ 可视化图表
 
 | 文件 | 作用 |
 |------|------|
@@ -116,7 +93,7 @@ scripts/
 ## ❓ 常见问题
 
 **Q: 可以删除旧文件吗？**
-A: 可以删除 `logs/` 和 `visualization_results/`，但 `checkpoints/` 建议保留
+A: 可以删除 `visualization_results/`，但 `checkpoints/` 建议保留。`logs/` 为训练临时产物，重新训练即可生成。
 
 **Q: pth文件能直接打开看吗？**
 A: 需要用Python加载：
