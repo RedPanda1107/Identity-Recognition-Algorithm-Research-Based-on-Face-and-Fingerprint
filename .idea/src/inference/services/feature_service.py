@@ -34,11 +34,15 @@ class FeatureService:
         device: str = "auto",
         checkpoint_dir: Optional[str] = None,
         num_classes: int = 500,
+        embedding_dim: int = 512,
+        fusion_dim: int = 256,
     ):
         self.model_loader = ModelLoader(
             device=device,
             checkpoint_dir=checkpoint_dir,
             num_classes=num_classes,
+            embedding_dim=embedding_dim,
+            fusion_dim=fusion_dim,
         )
         self._face: Optional[FaceInferencer] = None
         self._fingerprint: Optional[FingerprintInferencer] = None
@@ -68,7 +72,7 @@ class FeatureService:
         modality: Literal["face", "fingerprint"] = "face",
         face_image=None,
         fp_image=None,
-        fusion_method: Literal["simple", "adaptive", "gated", "hierarchical"] = "simple",
+        fusion_method: Literal["simple", "adaptive"] = "simple",
     ) -> np.ndarray:
         """统一特征提取接口
 
@@ -103,7 +107,7 @@ class FeatureService:
         self,
         face_image,
         fp_image,
-        method: Literal["simple", "adaptive", "gated", "hierarchical"] = "simple",
+        method: Literal["simple", "adaptive"] = "simple",
     ) -> np.ndarray:
         """提取融合特征"""
         result = self.fusion.extract_all(face_image, fp_image, method=method)
@@ -113,7 +117,7 @@ class FeatureService:
         self,
         face_image,
         fp_image,
-        method: Literal["simple", "adaptive", "gated", "hierarchical"] = "simple",
+        method: Literal["simple", "adaptive"] = "simple",
     ) -> dict:
         """同时提取人脸、指纹和融合特征"""
         return self.fusion.extract_all(face_image, fp_image, method=method)

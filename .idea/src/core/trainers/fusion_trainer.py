@@ -5,12 +5,14 @@
 """
 
 import os
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 import numpy as np
+import cv2
 from PIL import Image
 from torchvision import transforms
 
@@ -36,7 +38,13 @@ class FusionTrainer(BaseTrainer):
                  device='cuda', logger=None, pretrained_ckpts=None, freeze_backbone=False,
                  use_amp=True, accumulation_steps=1, seed=42,
                  experiment_mode='full', ablate_modality=None,
-                 label_smoothing=0.0, tb_writer=None):
+                 label_smoothing=0.0, tb_writer=None,
+                 face_dropout_prob=0.0, fp_corruption_prob=0.0,
+                 modality_drop_strategy='both',
+                 freeze_projection=False,
+                 entropy_penalty_weight=0.0,
+                 balance_lr=0.1, balance_weight_decay=2.0,
+                 zero_face_input=False, zero_fp_input=False):
         super().__init__(
             fusion_model, train_loader, val_loader, optimizer, scheduler,
             criterion, device, logger, tb_writer
@@ -49,9 +57,25 @@ class FusionTrainer(BaseTrainer):
         self.seed = seed
         self.experiment_mode = experiment_mode
         self.ablate_modality = ablate_modality
+        # 消融训练模式：将指定模态的 backbone 特征直接置零
+        # 与旧的 GatedIdentityAblation 硬截断不同，这里在特征提取层面直接零化
+        # 使得投影层和分类头能从对应单模态预训练权重开始 fine-tune
+        self.zero_face_input = zero_face_input
+        self.zero_fp_input = zero_fp_input
         self.label_smoothing = label_smoothing
         self.test_loader = test_loader
         self.test_dataset = test_loader.dataset if test_loader else None
+
+        # 模态平衡策略
+        self.face_dropout_prob = face_dropout_prob
+        self.fp_corruption_prob = fp_corruption_prob
+        # 'clean' | 'face_dropout' | 'fp_corruption' | 'both'
+        self.modality_drop_strategy = modality_drop_strategy
+        self.freeze_projection = freeze_projection
+        self.entropy_penalty_weight = entropy_penalty_weight
+        self._balance_lr = balance_lr
+        self._balance_weight_decay = balance_weight_decay
+        self._last_attention_weights = None
 
         # AMP 配置
         self.use_amp = use_amp and device.type == 'cuda'
@@ -75,46 +99,211 @@ class FusionTrainer(BaseTrainer):
         if freeze_backbone or experiment_mode == 'fusion_only':
             self._freeze_feature_extractors()
 
+        # 设置消融模式：
+        # 旧的 GatedIdentityAblation 硬截断已被移除。
+        # 消融现在通过 zero_face_input / zero_fp_input 在特征提取层面完成，
+        # 使得投影层能从单模态预训练权重开始 fine-tune。
+        if self.ablate_modality:
+            if self.ablate_modality == 'fingerprint':
+                self.zero_face_input = False
+                self.zero_fp_input = True   # 指纹置零，只用人脸
+                self.logger.info(f"[Ablation] fingerprint 输入置零（从 face checkpoint fine-tune）")
+            elif self.ablate_modality == 'face':
+                self.zero_fp_input = False
+                self.zero_face_input = True   # 人脸置零，只用指纹
+                self.logger.info(f"[Ablation] face 输入置零（从 fingerprint checkpoint fine-tune）")
+
         # 设置可训练参数
         self._setup_trainable_params()
 
         # 初始化验证集图像变换
         self._init_val_transforms()
 
+        # 注册 attention hook（捕获 per-batch 权重用于 entropy penalty）
+        self._attn_outputs = []
+        self._attn_hook_handle = None
+        if self.entropy_penalty_weight > 0:
+            self._register_attention_hook()
+
+        # 独立优化器：专门管理 logits_bias，快速响应均衡压力
+        self._balance_optimizer = None
+        self._balance_scheduler = None
+        if self.entropy_penalty_weight > 0:
+            self._setup_balance_optimizer()
+
+        # 模态腐败日志
+        if self.modality_drop_strategy in ('face_dropout', 'both') and self.face_dropout_prob > 0:
+            self.logger.info(f"[ModalityDrop] Face dropout: prob={self.face_dropout_prob}")
+        if self.modality_drop_strategy in ('fp_corruption', 'both') and self.fp_corruption_prob > 0:
+            self.logger.info(f"[ModalityDrop] FP corruption: prob={self.fp_corruption_prob}")
+
         # Gallery 缓存
         self._gallery_embeddings_cache = None
         self._gallery_labels_cache = None
         self._gallery_dirty = True
         self._last_best_acc = -1.0
+        self._ablation_verification_done = False  # 每个实验只做一次指纹独立验证
+
+    def _register_attention_hook(self):
+        """注册 attention hook 到 fusion_strategy 内部的 attention 层（用于 entropy penalty）"""
+        strategy = self.model.fusion_strategy
+        if hasattr(strategy, 'strategy'):
+            strategy = strategy.strategy
+        if hasattr(strategy, 'attention') and hasattr(strategy.attention, 'register_forward_hook'):
+            def _hook(module, inp, out):
+                # out 是 raw logits [B, 2]，需要 softmax 后再缓存
+                weights = F.softmax(out, dim=1)
+                self._attn_outputs.append(weights.detach())
+            self._attn_hook_handle = strategy.attention.register_forward_hook(_hook)
+            self.logger.info(
+                f"[EntropyPenalty] Registered attention hook "
+                f"(weight={self.entropy_penalty_weight})"
+            )
+
+    def _setup_balance_optimizer(self):
+        """为 logits_bias 创建独立的优化器和学习率调度器。
+
+        策略：
+        - lr: 高学习率（默认 0.1），比主优化器大 100 倍，快速响应均衡压力
+        - weight_decay: 强 L2 正则（默认 2.0），强制 logits_bias 趋向 0 → softmax → 0.5/0.5
+        - CosineAnnealingLR: 前期强制均衡，后期逐渐放松约束
+        """
+        strategy = self.model.fusion_strategy
+        if hasattr(strategy, 'strategy'):
+            strategy = strategy.strategy
+
+        bias_params = []
+        if hasattr(strategy, 'logits_bias') and strategy.logits_bias.requires_grad:
+            bias_params.append(strategy.logits_bias)
+            self.logger.info(f"[BalanceOpt] logits_bias found (shape={strategy.logits_bias.shape})")
+        else:
+            self.logger.warning("[BalanceOpt] logits_bias not found or frozen, skipping")
+            return
+
+        self._balance_optimizer = torch.optim.AdamW(
+            bias_params,
+            lr=self._balance_lr,
+            weight_decay=self._balance_weight_decay
+        )
+        self._balance_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self._balance_optimizer,
+            T_max=30,
+            eta_min=1e-4
+        )
+        self.logger.info(
+            f"[BalanceOpt] Separate optimizer for logits_bias: "
+            f"lr={self._balance_lr}, weight_decay={self._balance_weight_decay}, "
+            f"CosineAnnealing(T_max=30, eta_min=0.0001)"
+        )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 融合权重诊断工具
+    # ─────────────────────────────────────────────────────────────────────────
+    def _log_fusion_weights(self, phase: str, with_attention: bool = False):
+        """打印当前模型的融合权重状态（诊断用）
+
+        - Simple:  softmax(fusion_weight)
+        - Adaptive: logits_bias softmax 初始分布 + 真实 cached softmax 权重
+        - with_attention=True（仅 eval 阶段）: 使用 forward 后缓存的真实权重
+        """
+        model = self.model
+        if not hasattr(model, 'get_fusion_weights'):
+            return
+        w = model.get_fusion_weights()
+
+        if hasattr(model, 'get_cached_attention_weights') and with_attention:
+            gate_f, gate_fp = w
+            cached = model.get_cached_attention_weights()
+            if cached is not None:
+                attn_face, attn_fp = cached
+                attn_str = f"attn_face={attn_face:.4f} attn_fp={attn_fp:.4f}"
+            else:
+                # 调试：诊断缓存为空的原因
+                strategy = model.fusion_strategy
+                raw = None
+                if hasattr(strategy, 'get_cached_weights'):
+                    raw = strategy.get_cached_weights()
+                self.logger.warning(
+                    f"[DEBUG:attn] phase={phase} | raw_cached={raw} | "
+                    f"strategy_type={type(strategy).__name__}"
+                )
+                attn_str = "attn=N/A(cold)"
+            self.logger.info(
+                f"[{phase}权重] gate_face={gate_f:.4f} gate_fp={gate_fp:.4f} | {attn_str}"
+            )
+        elif hasattr(model, 'get_attention_weights'):
+            gate_f, gate_fp = w
+            self.logger.info(
+                f"[{phase}权重] gate_face={gate_f:.4f} gate_fp={gate_fp:.4f} | attn=N/A"
+            )
+        else:
+            # Simple
+            self.logger.info(
+                f"[{phase}权重] simple_face={w[0]:.4f} simple_fp={w[1]:.4f}"
+            )
+
+        # ── 消融验证：显式检查硬截断效果 ─────────────────────────────
+        if self.ablate_modality:
+            w = model.get_fusion_weights()
+            self.logger.info(
+                f"[AblationCheck] disabled={self.ablate_modality} | "
+                f"face_w={w[0]:.4f} fp_w={w[1]:.4f}"
+            )
 
     def _log_experiment_mode(self):
         """记录实验模式配置"""
         mode_descriptions = {
             'full': '训练全部（backbone + fusion）',
             'fusion_only': '冻结backbone，只训练融合层',
-            'face_ablation': '消融实验：指纹置零，测试单用人脸',
-            'fingerprint_ablation': '消融实验：人脸置零，测试单用指纹',
+            'face_ablation': '消融实验：从 face checkpoint fine-tune，指纹输入置零',
+            'fp_ablation': '消融实验：从 fingerprint checkpoint fine-tune，人脸输入置零',
         }
         desc = mode_descriptions.get(self.experiment_mode, '未知模式')
         self.logger.info(f"[Experiment] Mode: {self.experiment_mode} - {desc}")
-        if self.ablate_modality:
-            self.logger.info(f"[Ablation] Modality disabled: {self.ablate_modality}")
+        if self.zero_face_input:
+            self.logger.info(f"[Ablation] face 输入置零（zero_face_input=True）")
+        if self.zero_fp_input:
+            self.logger.info(f"[Ablation] fingerprint 输入置零（zero_fp_input=True）")
 
     def _init_val_transforms(self):
-        """初始化验证时的图像变换（用于Gallery特征提取）"""
+        """初始化验证时的图像变换（用于Gallery特征提取）
+
+        关键：指纹必须应用 CLAHE，与 FusionDataset.__getitem__ 中的处理保持一致。
+        FusionDataset 对指纹始终应用 CLAHE（use_clahe=True），所以验证时的 Gallery 特征
+        提取也必须应用 CLAHE，否则 Gallery 和 Query 的指纹预处理不对称。
+        """
+        # 指纹 CLAHE Transform（与 FusionDataset._apply_clahe 和 FingerprintDataset 保持一致）
+        class ClahePIL:
+            def __init__(self, clip_limit=2.0, tile_size=(8, 8)):
+                self._clahe = cv2.createCLAHE(
+                    clipLimit=clip_limit, tileGridSize=tile_size
+                )
+            def __call__(self, img: Image.Image) -> Image.Image:
+                img_np = np.array(img)
+                gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+                enhanced = self._clahe.apply(gray)
+                return Image.fromarray(cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB))
+
         self.val_face_transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
+        # 指纹：Resize → CLAHE → ToTensor → Normalize（与 FusionDataset pipeline 完全一致）
         self.val_fp_transform = transforms.Compose([
             transforms.Resize((224, 224)),
+            ClahePIL(),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
 
     def _setup_trainable_params(self):
-        """设置可训练参数"""
+        """设置可训练参数。
+
+        策略：
+          - Backbone：是否冻结由 freeze_backbone 控制
+          - Projection layers：默认解冻，freeze_projection=True 时冻结（仅 fusion_only 模式推荐）
+        """
         if self.freeze_backbone or self.experiment_mode == 'fusion_only':
             for p in self.model.parameters():
                 p.requires_grad = True
@@ -124,7 +313,14 @@ class FusionTrainer(BaseTrainer):
             if self.fingerprint_model:
                 for p in self.fingerprint_model.parameters():
                     p.requires_grad = False
-            self.logger.info("[Config] Training fusion only (backbones frozen)")
+            # 投影层：默认解冻；freeze_projection=True 时冻结
+            if self.freeze_projection:
+                for name, param in self.model.named_parameters():
+                    if 'proj' in name:
+                        param.requires_grad = False
+                self.logger.info("[Config] Training fusion head + classifier only (backbones + projections frozen)")
+            else:
+                self.logger.info("[Config] Training fusion head + projections (backbones frozen)")
         else:
             for p in self.model.parameters():
                 p.requires_grad = True
@@ -135,6 +331,12 @@ class FusionTrainer(BaseTrainer):
                 for p in self.fingerprint_model.parameters():
                     p.requires_grad = True
             self.logger.info("[Config] Training fusion + all backbones")
+
+        # 统计可训练参数
+        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.model.parameters())
+        self.logger.info(f"[Params] Fusion model: {trainable:,}/{total:,} trainable "
+                         f"({100*trainable/total:.1f}%)")
 
     def _load_single_modality_weights(self, model, ckpt_path, modality_name):
         """加载单个模态的预训练权重"""
@@ -161,8 +363,29 @@ class FusionTrainer(BaseTrainer):
         return False
 
     def _load_pretrained_weights(self, pretrained_ckpts):
-        """加载预训练权重"""
+        """加载预训练权重。
+
+        消融实验（face_ablation / fp_ablation）：
+          从对应单模态预训练权重开始 fine-tune，而非从头训练 ImageNet 权重。
+          这是消融实验公平对比的关键：消融模型的性能应该与单模态 baseline 对比，
+          两者都应该使用相同的单模态预训练初始化。
+
+        规则：
+          - full / fusion_only：从 face + fp 两个单模态 checkpoint 加载（与旧逻辑相同）
+          - face_ablation：从 face checkpoint 加载（用于 face-only 实验）
+          - fp_ablation：从 fingerprint checkpoint 加载（用于 fp-only 实验）
+        """
         if not pretrained_ckpts:
+            # 未指定预训练路径：尝试自动搜索
+            # face_ablation 只搜索 face checkpoint
+            # fp_ablation 只搜索 fingerprint checkpoint
+            # full / fusion_only 搜索两者
+            if self.experiment_mode == 'face_ablation':
+                self.logger.info("[Pretrained] face_ablation 模式：从 face checkpoint 加载")
+            elif self.experiment_mode == 'fp_ablation':
+                self.logger.info("[Pretrained] fp_ablation 模式：从 fingerprint checkpoint 加载")
+            else:
+                self.logger.info("[Pretrained] 未指定预训练路径，backbone 使用 ImageNet 预训练权重")
             return
 
         if self.face_model and pretrained_ckpts.get('face'):
@@ -172,59 +395,88 @@ class FusionTrainer(BaseTrainer):
             self._load_single_modality_weights(self.fingerprint_model, pretrained_ckpts['fingerprint'], "FP")
 
     def _freeze_feature_extractors(self):
-        """冻结特征提取器"""
+        """冻结特征提取器（standalone backbone）。投影层由 _setup_trainable_params 单独控制。"""
         if self.face_model:
             for param in self.face_model.parameters():
                 param.requires_grad = False
         if self.fingerprint_model:
             for param in self.fingerprint_model.parameters():
                 param.requires_grad = False
+        # 投影层冻结由 _setup_trainable_params 中的 freeze_projection 控制
 
     def _apply_ablation(self, face_features, fp_features):
-        """应用消融：将指定模态置零"""
-        if self.ablate_modality == 'face':
-            face_features = torch.zeros_like(face_features)
-            self.logger.debug("[Ablation] Face features zeroed out")
-        elif self.ablate_modality == 'fingerprint':
-            fp_features = torch.zeros_like(fp_features)
-            self.logger.debug("[Ablation] Fingerprint features zeroed out")
+        """已废弃。消融逻辑现已移入 fusion_model 内部（identity mask），
+        保留此方法是为了向后兼容，但不再做零截断。"""
         return face_features, fp_features
 
     def _extract_features_train(self, face_images, fp_images):
-        """训练时提取特征（允许梯度）"""
+        """训练时提取特征（允许梯度），支持批次级模态腐败策略。
+
+        模态腐败策略（modality_drop_strategy）：
+          - 'clean': 不做腐败，两个模态始终存在
+          - 'face_dropout': face 有 dropout_prob 概率整个批次置零
+          - 'fp_corruption': fp 有 corruption_prob 概率整个批次被腐蚀
+          - 'both': 两者都生效（推荐；face dropout + fp corruption）
+        """
         if self.face_model:
             self.face_model.train()
-            face_features = self.face_model(face_images)
+            face_out = self.face_model(face_images, return_features=True)
+            face_features = face_out[1] if isinstance(face_out, tuple) else face_out
         else:
             face_features = torch.randn(face_images.size(0), 512, device=self.device)
 
         if self.fingerprint_model:
             self.fingerprint_model.train()
-            fp_features = self.fingerprint_model(fp_images)
+            fp_out = self.fingerprint_model(fp_images, return_features=True)
+            fp_features = fp_out[1] if isinstance(fp_out, tuple) else fp_out
         else:
             fp_features = torch.randn(fp_images.size(0), 512, device=self.device)
 
-        face_features, fp_features = self._apply_ablation(face_features, fp_features)
+        # 消融模式：将指定模态特征置零
+        if self.zero_face_input:
+            face_features = torch.zeros_like(face_features)
+        if self.zero_fp_input:
+            fp_features = torch.zeros_like(fp_features)
+
+        # ── 模态腐败策略 ──────────────────────────────────────
+        if self.modality_drop_strategy in ('face_dropout', 'both'):
+            if self.face_dropout_prob > 0 and random.random() < self.face_dropout_prob:
+                face_features = torch.zeros_like(face_features)
+
+        if self.modality_drop_strategy in ('fp_corruption', 'both'):
+            if self.fp_corruption_prob > 0 and random.random() < self.fp_corruption_prob:
+                noise = torch.randn_like(fp_features) * 0.1
+                fp_features = fp_features * 0.7 + noise
 
         return face_features, fp_features
 
     def _extract_features_eval(self, face_images, fp_images):
-        """验证时提取特征（无梯度）"""
+        """验证时提取特征（无梯度）
+
+        使用 return_features=True 确保始终返回嵌入向量。
+        消融模式（zero_face_input / zero_fp_input）：与训练一致，将指定模态置零。
+        """
         if self.face_model:
             self.face_model.eval()
             with torch.no_grad():
-                face_features = self.face_model(face_images)
+                face_out = self.face_model(face_images, return_features=True)
+                face_features = face_out[1] if isinstance(face_out, tuple) else face_out
         else:
             face_features = torch.randn(face_images.size(0), 512, device=self.device)
 
         if self.fingerprint_model:
             self.fingerprint_model.eval()
             with torch.no_grad():
-                fp_features = self.fingerprint_model(fp_images)
+                fp_out = self.fingerprint_model(fp_images, return_features=True)
+                fp_features = fp_out[1] if isinstance(fp_out, tuple) else fp_out
         else:
             fp_features = torch.randn(fp_images.size(0), 512, device=self.device)
 
-        face_features, fp_features = self._apply_ablation(face_features, fp_features)
+        # 消融模式：与训练保持一致
+        if self.zero_face_input:
+            face_features = torch.zeros_like(face_features)
+        if self.zero_fp_input:
+            fp_features = torch.zeros_like(fp_features)
 
         return face_features, fp_features
 
@@ -304,7 +556,8 @@ class FusionTrainer(BaseTrainer):
                 fp_features = torch.where(torch.isnan(fp_features),
                     torch.zeros_like(fp_features), fp_features)
 
-                outputs = self.model(face_features, fp_features)
+                # 传入 labels 以激活 ArcFace margin（无 labels 时 ArcFace 仅返回 cos*s，无 margin）
+                outputs = self.model(face_features, fp_features, labels=targets)
                 if torch.isnan(outputs).any() or torch.isinf(outputs).any():
                     return None, outputs, 0.0, "logits_nan"
 
@@ -324,7 +577,7 @@ class FusionTrainer(BaseTrainer):
             fp_features = torch.where(torch.isnan(fp_features),
                 torch.zeros_like(fp_features), fp_features)
 
-            outputs = self.model(face_features, fp_features)
+            outputs = self.model(face_features, fp_features, labels=targets)
             if torch.isnan(outputs).any() or torch.isinf(outputs).any():
                 return None, outputs, 0.0, "logits_nan"
 
@@ -332,6 +585,19 @@ class FusionTrainer(BaseTrainer):
                 loss = self._criterion_ls(outputs.float(), targets)
             else:
                 loss = self.criterion(outputs.float(), targets)
+
+        # ── Attention 均衡正则化：直接惩罚权重偏离 0.5 ──────────────────
+        # 目标：使 attention weights 趋向 (0.5, 0.5)，即 logits 趋向 (0, 0)
+        # 对 logits 本身做 L2 正则，等价于推动 softmax 权重趋向均匀分布
+        balance_loss = 0.0
+        if self.entropy_penalty_weight > 0 and self._attn_outputs:
+            attn = self._attn_outputs[-1]   # [B, 2] softmax weights
+            self._attn_outputs.clear()
+            # 惩罚偏离均匀分布的程度：deviation = ||w - 0.5||_2
+            # 熵正则的变体：直接对 softmax 权重做 L2 损失趋向 0.5
+            deviation = ((attn - 0.5) ** 2).mean()  # scalar
+            balance_loss = deviation
+            loss = loss + self.entropy_penalty_weight * balance_loss
 
         if torch.isnan(loss):
             return None, outputs, 0.0, "loss_nan"
@@ -358,6 +624,9 @@ class FusionTrainer(BaseTrainer):
         scaler = self._scaler
         nan_count = 0
         nan_reasons = {}
+
+        # ── 打印融合权重诊断（每 epoch 一次，使用上一 batch 缓存的 attention 权重）──
+        self._log_fusion_weights("Trn", with_attention=True)
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1} [Train]", leave=False)
 
@@ -389,6 +658,11 @@ class FusionTrainer(BaseTrainer):
                     self.optimizer.step()
                 self.optimizer.zero_grad()
 
+                # 独立优化 logits_bias（高 lr + 强 weight_decay）
+                if self._balance_optimizer is not None:
+                    self._balance_optimizer.step()
+                    self._balance_optimizer.zero_grad()
+
             batch_size = outputs.size(0)
             loss_meter.update(loss.item(), batch_size)
             acc_meter.update(acc, batch_size)
@@ -398,6 +672,21 @@ class FusionTrainer(BaseTrainer):
             fp_images = batch['fingerprint_image'].to(self.device)
             with torch.no_grad():
                 face_feat, fp_feat = self._extract_features_eval(face_images, fp_images)
+
+                # ── 断点监控：验证硬置零效果 ─────────────────────────────
+                _train_debug_printed = getattr(self, '_train_debug_printed', 0)
+                if _train_debug_printed < 3:
+                    face_nan = torch.isnan(face_feat).sum().item()
+                    fp_nan = torch.isnan(fp_feat).sum().item()
+                    self.logger.info(
+                        f"[DEBUG:train:{_train_debug_printed}] "
+                        f"face_feat: mean={face_feat.mean().item():.6f} "
+                        f"std={face_feat.std().item():.6f} nan={face_nan} "
+                        f"| fp_feat: mean={fp_feat.mean().item():.6f} "
+                        f"std={fp_feat.std().item():.6f} nan={fp_nan}"
+                    )
+                    self._train_debug_printed = _train_debug_printed + 1
+
                 fused = self.model.extract_fused_features(face_feat, fp_feat)
                 fused = F.normalize(fused, p=2, dim=1)
                 feat_norm = fused.norm(dim=1).mean().item()
@@ -420,6 +709,9 @@ class FusionTrainer(BaseTrainer):
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
             self.optimizer.zero_grad()
+            if self._balance_optimizer is not None:
+                self._balance_optimizer.step()
+                self._balance_optimizer.zero_grad()
 
         if nan_count > 0:
             nan_detail = ", ".join(f"{k}={v}" for k, v in nan_reasons.items())
@@ -450,6 +742,11 @@ class FusionTrainer(BaseTrainer):
 
         return loss_meter.avg, acc_meter.avg
 
+    def step_balance_scheduler(self):
+        """每个 epoch 结束后步进 balance 学习率调度器（由 train_fusion.py 调用）"""
+        if self._balance_scheduler is not None:
+            self._balance_scheduler.step()
+
     # ─────────────────────────────────────────────────────────────────────────
     # 单轮验证（Gallery/Query 1:N 余弦相似度检索）
     # ─────────────────────────────────────────────────────────────────────────
@@ -467,7 +764,7 @@ class FusionTrainer(BaseTrainer):
         self.model.eval()
         val_dataset = self.val_loader.dataset
 
-        # ── 检查 Gallery/Query 数据是否就绪 ───────────────────────────────
+        # ── 检查 Gallery/Query 数据是否就绪
         if not hasattr(val_dataset, 'val_gallery_paths') or not val_dataset.val_gallery_paths:
             self.logger.error("[验证] val_gallery_paths 不存在！检查 FusionDataset 是否已更新。")
             return 0.0, 0.0, {}
@@ -497,6 +794,20 @@ class FusionTrainer(BaseTrainer):
             fused_features = self.model.extract_fused_features(face_features, fp_features)
             fused_features = F.normalize(fused_features, p=2, dim=1)
 
+            # ── 断点监控：打印特征统计（仅前 3 个 batch）─────────────────
+            _gallery_debug_printed = getattr(self, '_gallery_debug_printed', 0)
+            if _gallery_debug_printed < 3:
+                face_nan = torch.isnan(face_features).sum().item()
+                fp_nan = torch.isnan(fp_features).sum().item()
+                self.logger.info(
+                    f"[DEBUG:gallery:{start_idx//batch_size}] "
+                    f"face_feat: mean={face_features.mean().item():.6f} "
+                    f"std={face_features.std().item():.6f} nan={face_nan} "
+                    f"| fp_feat: mean={fp_features.mean().item():.6f} "
+                    f"std={fp_features.std().item():.6f} nan={fp_nan}"
+                )
+                self._gallery_debug_printed = _gallery_debug_printed + 1
+
             feat_norm = fused_features.norm(dim=1).mean().item()
             if not np.isnan(feat_norm):
                 feat_norm_g_meter.update(feat_norm, fused_features.size(0))
@@ -519,9 +830,14 @@ class FusionTrainer(BaseTrainer):
         query_labels_list = []
         feat_norm_q_meter = AverageMeter()
         loss_meter = AverageMeter()
+        # Validation loss is not computed here (ArcFace without labels → meaningless).
+        # The real evaluation metric is the Gallery/Query retrieval accuracy.
 
         self.logger.info("[验证] 正在提取 Query 特征...")
         pbar_q = tqdm(self.val_loader, desc=f"Epoch {epoch+1} [Val]", leave=False)
+        # 保留原始 backbone 特征用于消融验证（直接在各模态置零后重新融合）
+        self._raw_query_face_list = []
+        self._raw_query_fp_list = []
         for batch in pbar_q:
             face_images = batch['face_image'].to(self.device)
             fp_images = batch['fingerprint_image'].to(self.device)
@@ -533,6 +849,24 @@ class FusionTrainer(BaseTrainer):
             else:
                 face_features, fp_features = self._extract_features_eval(face_images, fp_images)
 
+            # 保留原始 backbone 特征（消融验证直接复用，不重新跑 backbone）
+            self._raw_query_face_list.append(face_features.detach().cpu())
+            self._raw_query_fp_list.append(fp_features.detach().cpu())
+
+            # ── 断点监控：打印特征统计（仅前 3 个 batch）─────────────────
+            _query_debug_printed = getattr(self, '_query_debug_printed', 0)
+            if _query_debug_printed < 3:
+                face_nan = torch.isnan(face_features).sum().item()
+                fp_nan = torch.isnan(fp_features).sum().item()
+                self.logger.info(
+                    f"[DEBUG:query:{_query_debug_printed}] "
+                    f"face_feat: mean={face_features.mean().item():.6f} "
+                    f"std={face_features.std().item():.6f} nan={face_nan} "
+                    f"| fp_feat: mean={fp_features.mean().item():.6f} "
+                    f"std={fp_features.std().item():.6f} nan={fp_nan}"
+                )
+                self._query_debug_printed = _query_debug_printed + 1
+
             fused_features = self.model.extract_fused_features(face_features, fp_features)
             fused_features_q = F.normalize(fused_features, p=2, dim=1)
 
@@ -542,16 +876,6 @@ class FusionTrainer(BaseTrainer):
 
             query_embeddings_list.append(fused_features_q.cpu())
             query_labels_list.extend(targets.tolist())
-
-            # 计算分类 loss（仅用于监控，与检索指标无关）
-            with torch.no_grad():
-                outputs = self.model(face_features, fp_features)
-                if self._criterion_ls is not None:
-                    l = self._criterion_ls(outputs.float(), targets.to(self.device))
-                else:
-                    l = self.criterion(outputs.float(), targets.to(self.device))
-                if not torch.isnan(l):
-                    loss_meter.update(l.item(), face_images.size(0))
 
         if not query_embeddings_list:
             self.logger.error("[验证] 没有 Query 样本！")
@@ -569,6 +893,9 @@ class FusionTrainer(BaseTrainer):
             f"{len(np.unique(query_labels))} 个验证人, "
             f"特征范数={feat_norm_q_meter.avg:.4f}"
         )
+
+        # ── 打印融合权重诊断（使用 Query 循环中 forward 缓存的 attention 权重）────
+        self._log_fusion_weights("Val", with_attention=True)
 
         # ── 步骤 3：计算余弦相似度矩阵 ────────────────────────────────
         self.logger.info("[验证] 正在计算相似度矩阵...")
@@ -634,6 +961,90 @@ class FusionTrainer(BaseTrainer):
                 )
         except Exception as e:
             self.logger.warning(f"[EER计算] 失败: {e}")
+
+        # ── 模态独立性验证（两种消融模式各执行一次）──────────────────────────────────
+        # query_embeddings: 250 样本（50 人，每人 5 剩余样本）
+        # gallery_embeddings: 150 对（50 人，每人 3 gallery 样本）
+        # 消融验证在原始 backbone 特征上重新融合（不重新跑 backbone）
+        if self.ablate_modality and not self._ablation_verification_done:
+            self._ablation_verification_done = True
+            self.logger.info("=" * 60)
+
+            raw_face = torch.cat(self._raw_query_face_list, dim=0).to(self.device)
+            raw_fp = torch.cat(self._raw_query_fp_list, dim=0).to(self.device)
+
+            if self.ablate_modality == 'fingerprint':
+                self.logger.info("[AblationVerification:face_ablation] 禁用指纹，仅用人脸特征检索...")
+                orig_ablate_modality = self.model._ablate_modality
+                self.model.set_ablation(None)
+
+                face_zeros = torch.zeros_like(raw_face)
+                with torch.no_grad():
+                    fused = self.model.extract_fused_features(face_zeros, raw_fp)
+                    fp_only_query_emb = F.normalize(fused, p=2, dim=1)
+
+                fp_only_sim = torch.mm(fp_only_query_emb, gallery_embeddings.to(fp_only_query_emb.device).t())
+                _, fp_only_top1 = torch.topk(fp_only_sim, k=1, dim=1)
+                fp_only_top1_labels = gallery_labels_arr[fp_only_top1.cpu().numpy()]
+                fp_only_correct = sum(
+                    1 for i in range(len(query_labels))
+                    if query_labels[i] == fp_only_top1_labels[i, 0]
+                )
+                fp_only_rank1 = fp_only_correct / len(query_labels)
+                self.logger.info(
+                    f"[AblationVerification:face_ablation] "
+                    f"纯指纹 Rank-1 = {fp_only_rank1:.4f} (期望约等于纯指纹单模态基线)"
+                )
+                self.logger.info(
+                    f"[AblationVerification:face_ablation] "
+                    f"融合 Rank-1 = {rank1_acc:.4f}"
+                )
+                if fp_only_rank1 < 0.50:
+                    self.logger.info("[AblationVerification] PASS: 纯指纹 Rank-1 < 50%")
+                else:
+                    self.logger.warning(
+                        f"[AblationVerification] WARN: 纯指纹 Rank-1 = {fp_only_rank1:.4f} 异常高"
+                    )
+
+                self.model.set_ablation(orig_ablate_modality)
+                self.logger.info("[AblationVerification] 已恢复原始 gate 状态")
+            elif self.ablate_modality == 'face':
+                self.logger.info("[AblationVerification:fp_ablation] 禁用人脸，仅用指纹特征检索...")
+                orig_ablate_modality = self.model._ablate_modality
+                self.model.set_ablation(None)
+
+                fp_zeros = torch.zeros_like(raw_fp)
+                with torch.no_grad():
+                    fused = self.model.extract_fused_features(raw_face, fp_zeros)
+                    face_only_query_emb = F.normalize(fused, p=2, dim=1)
+
+                face_only_sim = torch.mm(face_only_query_emb, gallery_embeddings.to(face_only_query_emb.device).t())
+                _, face_only_top1 = torch.topk(face_only_sim, k=1, dim=1)
+                face_only_top1_labels = gallery_labels_arr[face_only_top1.cpu().numpy()]
+                face_only_correct = sum(
+                    1 for i in range(len(query_labels))
+                    if query_labels[i] == face_only_top1_labels[i, 0]
+                )
+                face_only_rank1 = face_only_correct / len(query_labels)
+                self.logger.info(
+                    f"[AblationVerification:fp_ablation] "
+                    f"纯人脸 Rank-1 = {face_only_rank1:.4f}"
+                )
+                self.logger.info(
+                    f"[AblationVerification:fp_ablation] "
+                    f"融合 Rank-1 = {rank1_acc:.4f}"
+                )
+                if face_only_rank1 < 0.50:
+                    self.logger.info("[AblationVerification] PASS: 纯人脸 Rank-1 < 50%")
+                else:
+                    self.logger.warning(
+                        f"[AblationVerification] WARN: 纯人脸 Rank-1 = {face_only_rank1:.4f} 异常高"
+                    )
+
+                self.model.set_ablation(orig_ablate_modality)
+                self.logger.info("[AblationVerification] 已恢复原始 gate 状态")
+
+            self.logger.info("=" * 60)
 
         # ── 步骤 6：汇总指标 ─────────────────────────────────────
         metrics = {
@@ -701,6 +1112,9 @@ class FusionTrainer(BaseTrainer):
     def test_epoch(self, epoch=None, total_epochs=None, use_amp=False):
         """在测试集上进行评估（与 validate_epoch 逻辑相同，但使用测试集）。"""
         self.model.eval()
+
+        # ── 打印融合权重诊断（使用 Query 循环中 forward 缓存的 attention 权重）────
+        self._log_fusion_weights("Test", with_attention=True)
 
         test_dataset = getattr(self, 'test_dataset', None)
         if test_dataset is None:
@@ -895,6 +1309,12 @@ class FusionTrainer(BaseTrainer):
             "model_state": self.model.state_dict(),
             "optimizer_state": self.optimizer.state_dict(),
             "scheduler_state": self.scheduler.state_dict() if self.scheduler else None,
+            "balance_optimizer_state": (
+                self._balance_optimizer.state_dict() if self._balance_optimizer else None
+            ),
+            "balance_scheduler_state": (
+                self._balance_scheduler.state_dict() if self._balance_scheduler else None
+            ),
             "epoch": epoch or 0,
         }
         if self.face_model:
@@ -916,9 +1336,14 @@ class FusionTrainer(BaseTrainer):
             self.face_model.load_state_dict(checkpoint['face_model_state'])
         if checkpoint.get('fp_model_state') and self.fingerprint_model:
             self.fingerprint_model.load_state_dict(checkpoint['fp_model_state'])
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        if checkpoint.get('optimizer'):
+            self.optimizer.load_state_dict(checkpoint['optimizer'])
         if self.scheduler and checkpoint.get('scheduler_state'):
             self.scheduler.load_state_dict(checkpoint['scheduler_state'])
+        if self._balance_optimizer and checkpoint.get('balance_optimizer_state'):
+            self._balance_optimizer.load_state_dict(checkpoint['balance_optimizer_state'])
+        if self._balance_scheduler and checkpoint.get('balance_scheduler_state'):
+            self._balance_scheduler.load_state_dict(checkpoint['balance_scheduler_state'])
         self.current_epoch = checkpoint.get('epoch', 0)
         self.logger.info(f"[Load] Checkpoint: {path}")
         return checkpoint

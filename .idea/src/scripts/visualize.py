@@ -61,7 +61,10 @@ def load_biometric_results(biometric_dir, epoch):
 
 
 def extract_training_curves(history_data):
-    """Extract training curves data from history"""
+    """Extract training curves data from history.
+
+    Supports both face-style (val_acc) and fingerprint-style (val_rank1) fields.
+    """
     epochs = []
     train_losses = []
     val_losses = []
@@ -73,16 +76,28 @@ def extract_training_curves(history_data):
 
     for epoch_data in history_data["epochs"]:
         epochs.append(epoch_data["epoch"])
-        train_losses.append(epoch_data["train_loss"])
-        val_losses.append(epoch_data["val_loss"])
-        train_accs.append(epoch_data["train_acc"])
-        val_accs.append(epoch_data["val_acc"])
-        learning_rates.append(epoch_data.get("learning_rate", 0))
+        train_losses.append(epoch_data.get("train_loss", 0))
+        val_losses.append(epoch_data.get("val_loss", 0))
+        train_accs.append(epoch_data.get("train_acc", 0))
 
-        # Extract biometric metrics if available
-        biometric = epoch_data.get("biometric_metrics", {})
-        biometric_eers.append(biometric.get("eer", 0))
-        biometric_aucs.append(biometric.get("auc", 0))
+        # Support both face-style (val_acc) and fingerprint-style (val_rank1)
+        val_accs.append(epoch_data.get("val_acc") or epoch_data.get("val_rank1", 0))
+
+        # learning_rate can be a scalar or a list (fingerprint-style)
+        lr = epoch_data.get("learning_rate") or epoch_data.get("learning_rates")
+        if isinstance(lr, list):
+            lr = lr[0] if lr else 0
+        learning_rates.append(lr or 0)
+
+        # Biometric metrics may be stored directly in epoch_data or under biometric_metrics key
+        # Face uses biometric_metrics sub-dict; fingerprint stores them flat
+        if "biometric_metrics" in epoch_data and epoch_data["biometric_metrics"]:
+            bm = epoch_data["biometric_metrics"]
+            biometric_eers.append(bm.get("eer", 0))
+            biometric_aucs.append(bm.get("auc", 0))
+        else:
+            biometric_eers.append(epoch_data.get("val_eer", 0))
+            biometric_aucs.append(epoch_data.get("val_auc", 0))
 
     return {
         "epochs": epochs,
@@ -92,7 +107,7 @@ def extract_training_curves(history_data):
         "val_accs": val_accs,
         "learning_rates": learning_rates,
         "biometric_eers": biometric_eers,
-        "biometric_aucs": biometric_aucs
+        "biometric_aucs": biometric_aucs,
     }
 
 
@@ -156,7 +171,13 @@ def compute_next_run_index(exp_output_dir):
 
 
 def generate_experiment_plots(experiment_dir, experiment_name, modality, output_dir, include_run_seq=False):
-    """Generate plots for a single experiment"""
+    """Generate plots for a single experiment.
+
+    When called via subprocess from training scripts, experiment_dir is already
+    the experiment-specific directory (e.g. outputs/fingerprint/fingerprint_recognition)
+    and output_dir is the dedicated figures directory (e.g. outputs/fingerprint/fingerprint_recognition).
+    Plots go directly under output_dir without further nesting.
+    """
     print(f"Processing experiment: {experiment_name} ({modality})")
 
     # Load training history
@@ -164,12 +185,8 @@ def generate_experiment_plots(experiment_dir, experiment_name, modality, output_
     history_data = load_training_history(history_path)
 
     if not history_data:
-        print(f"Skipping {experiment_name}: no training history found")
+        print(f"Skipping {experiment_name}: no training history found at {history_path}")
         return
-
-    # Create output directory structure
-    exp_output_dir = os.path.join(output_dir, modality, experiment_name)
-    os.makedirs(exp_output_dir, exist_ok=True)
 
     # Extract training curves
     curves_data = extract_training_curves(history_data)
@@ -177,16 +194,16 @@ def generate_experiment_plots(experiment_dir, experiment_name, modality, output_
     # Generate timestamp
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
-    # Compute run index if requested (a+b style)
+    # Compute run index if requested
     run_index = None
     if include_run_seq:
-        run_index = compute_next_run_index(exp_output_dir)
+        run_index = compute_next_run_index(output_dir)
 
-    # Plot training curves
+    # Plot training curves — save directly under output_dir
     if run_index is not None:
-        training_curve_path = os.path.join(exp_output_dir, f"training_curves_run_{run_index:03d}_{timestamp}.png")
+        training_curve_path = os.path.join(output_dir, f"training_curves_run_{run_index:03d}_{timestamp}.png")
     else:
-        training_curve_path = os.path.join(exp_output_dir, f"training_curves_{timestamp}.png")
+        training_curve_path = os.path.join(output_dir, f"training_curves_{timestamp}.png")
     plot_training_curves(
         curves_data["train_losses"],
         curves_data["val_losses"],
@@ -197,9 +214,9 @@ def generate_experiment_plots(experiment_dir, experiment_name, modality, output_
 
     # Plot learning rate curve
     if run_index is not None:
-        lr_curve_path = os.path.join(exp_output_dir, f"learning_rate_run_{run_index:03d}_{timestamp}.png")
+        lr_curve_path = os.path.join(output_dir, f"learning_rate_run_{run_index:03d}_{timestamp}.png")
     else:
-        lr_curve_path = os.path.join(exp_output_dir, f"learning_rate_{timestamp}.png")
+        lr_curve_path = os.path.join(output_dir, f"learning_rate_{timestamp}.png")
     plot_learning_rate_curve(
         curves_data["epochs"],
         curves_data["learning_rates"],
@@ -209,9 +226,9 @@ def generate_experiment_plots(experiment_dir, experiment_name, modality, output_
     # Plot biometric evolution if data available
     if any(curves_data["biometric_eers"]) and any(curves_data["biometric_aucs"]):
         if run_index is not None:
-            biometric_evolution_path = os.path.join(exp_output_dir, f"biometric_evolution_run_{run_index:03d}_{timestamp}.png")
+            biometric_evolution_path = os.path.join(output_dir, f"biometric_evolution_run_{run_index:03d}_{timestamp}.png")
         else:
-            biometric_evolution_path = os.path.join(exp_output_dir, f"biometric_evolution_{timestamp}.png")
+            biometric_evolution_path = os.path.join(output_dir, f"biometric_evolution_{timestamp}.png")
         plot_biometric_evolution(
             curves_data["epochs"],
             curves_data["biometric_eers"],
@@ -222,33 +239,29 @@ def generate_experiment_plots(experiment_dir, experiment_name, modality, output_
     # Generate biometric plots for best epoch
     biometric_dir = os.path.join(experiment_dir, "biometric_results")
     if os.path.exists(biometric_dir):
-        # Find the epoch with best validation accuracy
-        best_epoch = max(history_data["epochs"], key=lambda x: x["val_acc"])["epoch"]
+        best_epoch = max(history_data["epochs"], key=lambda x: x.get("val_acc") or x.get("val_rank1", 0))["epoch"]
 
         biometric_results = load_biometric_results(biometric_dir, best_epoch)
         if biometric_results:
-            # Plot ROC curves
             if run_index is not None:
-                roc_path = os.path.join(exp_output_dir, f"roc_curves_epoch_{best_epoch}_run_{run_index:03d}_{timestamp}.png")
+                roc_path = os.path.join(output_dir, f"roc_curves_epoch_{best_epoch}_run_{run_index:03d}_{timestamp}.png")
             else:
-                roc_path = os.path.join(exp_output_dir, f"roc_curves_epoch_{best_epoch}_{timestamp}.png")
+                roc_path = os.path.join(output_dir, f"roc_curves_epoch_{best_epoch}_{timestamp}.png")
             plot_roc_curves(biometric_results, save_path=roc_path)
 
-            # Plot DET curves
             if run_index is not None:
-                det_path = os.path.join(exp_output_dir, f"det_curves_epoch_{best_epoch}_run_{run_index:03d}_{timestamp}.png")
+                det_path = os.path.join(output_dir, f"det_curves_epoch_{best_epoch}_run_{run_index:03d}_{timestamp}.png")
             else:
-                det_path = os.path.join(exp_output_dir, f"det_curves_epoch_{best_epoch}_{timestamp}.png")
+                det_path = os.path.join(output_dir, f"det_curves_epoch_{best_epoch}_{timestamp}.png")
             plot_det_curves(biometric_results, save_path=det_path)
 
-            # Plot FAR/FRR curves
             if run_index is not None:
-                far_frr_path = os.path.join(exp_output_dir, f"far_frr_curves_epoch_{best_epoch}_run_{run_index:03d}_{timestamp}.png")
+                far_frr_path = os.path.join(output_dir, f"far_frr_curves_epoch_{best_epoch}_run_{run_index:03d}_{timestamp}.png")
             else:
-                far_frr_path = os.path.join(exp_output_dir, f"far_frr_curves_epoch_{best_epoch}_{timestamp}.png")
+                far_frr_path = os.path.join(output_dir, f"far_frr_curves_epoch_{best_epoch}_{timestamp}.png")
             plot_far_frr_curves(biometric_results, save_path=far_frr_path)
 
-    print(f"Plots saved to: {exp_output_dir}")
+    print(f"Plots saved to: {output_dir}")
 
 
 def generate_comparison_plots(all_experiments, output_dir):
@@ -357,53 +370,81 @@ def generate_comparison_plots(all_experiments, output_dir):
     print(f"Comparison plots saved to: {comparison_dir}")
 
 
+def _infer_modality_from_path(exp_dir, valid_modalities):
+    """Infer modality from experiment directory path."""
+    for m in valid_modalities:
+        if m in exp_dir.lower():
+            return m
+    return valid_modalities[0]
+
+
 def main():
     args = parse_args()
 
+    # 确定性种子：确保可视化结果可重现
+    set_seed(42)
+
     print("Starting visualization generation...")
-    print(f"Logs directory: {args.logs_dir}")
     print(f"Output directory: {args.output_dir}")
-    print(f"Modalities: {args.modalities}")
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Collect all experiments
     all_experiments = {}
 
-    for modality in args.modalities:
-        modality_dir = os.path.join(args.logs_dir, modality)
-        if not os.path.exists(modality_dir):
-            print(f"Warning: Modality directory not found: {modality_dir}")
-            continue
+    # ── Mode 1: single experiment via --experiment_dir (used by training scripts) ──
+    if args.experiment_dir:
+        exp_dir = os.path.abspath(args.experiment_dir)
+        exp_name = os.path.basename(exp_dir.rstrip(os.sep))
+        # Infer modality from path
+        modality = _infer_modality_from_path(exp_dir, args.modalities)
 
-        # Find all experiment directories
-        experiment_dirs = glob.glob(os.path.join(modality_dir, args.experiment_pattern))
+        print(f"Processing single experiment: {exp_name} ({modality})")
+        print(f"  experiment_dir: {exp_dir}")
 
-        all_experiments[modality] = {}
+        history_path = os.path.join(exp_dir, "training_history.json")
+        history_data = load_training_history(history_path)
 
-        for exp_dir in experiment_dirs:
-            if not os.path.isdir(exp_dir):
+        if history_data:
+            all_experiments[modality] = {exp_name: history_data}
+            generate_experiment_plots(exp_dir, exp_name, modality, args.output_dir, include_run_seq=args.include_run_seq)
+        else:
+            print(f"Warning: No valid training history for {exp_dir}")
+
+    # ── Mode 2: batch scan logs_dir (manual/standalone usage) ──
+    else:
+        print(f"Logs directory: {args.logs_dir}")
+        print(f"Modalities: {args.modalities}")
+
+        for modality in args.modalities:
+            modality_dir = os.path.join(args.logs_dir, modality)
+            if not os.path.exists(modality_dir):
+                print(f"Warning: Modality directory not found: {modality_dir}")
                 continue
 
-            exp_name = os.path.basename(exp_dir)
-            print(f"Found experiment: {modality}/{exp_name}")
+            experiment_dirs = glob.glob(os.path.join(modality_dir, args.experiment_pattern))
 
-            # Load training history for this experiment
-            history_path = os.path.join(exp_dir, "training_history.json")
-            history_data = load_training_history(history_path)
+            all_experiments[modality] = {}
 
-            if history_data:
-                all_experiments[modality][exp_name] = history_data
+            for exp_dir in experiment_dirs:
+                if not os.path.isdir(exp_dir):
+                    continue
 
-                # Generate plots for this experiment
-                generate_experiment_plots(exp_dir, exp_name, modality, args.output_dir)
-            else:
-                print(f"Warning: No valid training history for {modality}/{exp_name}")
+                exp_name = os.path.basename(exp_dir)
+                print(f"Found experiment: {modality}/{exp_name}")
 
-    # Generate comparison plots if requested
-    if args.generate_comparison and len(all_experiments) > 1:
-        generate_comparison_plots(all_experiments, args.output_dir)
+                history_path = os.path.join(exp_dir, "training_history.json")
+                history_data = load_training_history(history_path)
+
+                if history_data:
+                    all_experiments[modality][exp_name] = history_data
+                    generate_experiment_plots(exp_dir, exp_name, modality, args.output_dir)
+                else:
+                    print(f"Warning: No valid training history for {modality}/{exp_name}")
+
+        # Generate comparison plots if requested
+        if args.generate_comparison and len(all_experiments) > 1:
+            generate_comparison_plots(all_experiments, args.output_dir)
 
     # Save summary
     summary = {

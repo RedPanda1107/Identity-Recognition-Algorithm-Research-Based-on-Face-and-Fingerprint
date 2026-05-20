@@ -1,13 +1,21 @@
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import os
 from torchvision import transforms
 import pandas as pd
 import random
 import logging
+import cv2
+import numpy as np
 
 _logger = logging.getLogger(__name__)
+
+# 预定义的归一化参数（集中管理，与所有数据集和推理 pipeline 统一）
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+CLAHE_CLIP_LIMIT = 2.0
+CLAHE_TILE_SIZE = (8, 8)
 
 
 class FusionDataset(Dataset):
@@ -22,7 +30,8 @@ class FusionDataset(Dataset):
                  face_image_size=224, fingerprint_image_size=224,
                  transform=None, augment=True, seed=42,
                  split_ratio=0.8, test_split_ratio=0.5,
-                 gallery_per_person=3, class_to_idx=None):
+                 gallery_per_person=3, class_to_idx=None,
+                 use_clahe=True):
         """
         Args:
             face_data_dir: 人脸数据目录路径
@@ -38,6 +47,7 @@ class FusionDataset(Dataset):
             test_split_ratio: 在剩余人员中，val/test 划分比例 (default 0.5)
             gallery_per_person: Number of gallery samples per person (default 3)
             class_to_idx: 共享的类别映射（从训练集传入）
+            use_clahe: 是否对指纹图像应用 CLAHE 增强（增强脊线对比度，默认 True）
         """
         self.face_data_dir = face_data_dir
         self.fingerprint_data_dir = fingerprint_data_dir
@@ -53,6 +63,7 @@ class FusionDataset(Dataset):
         self.gallery_per_person = gallery_per_person
         self.augmentation_params = None
         self._external_class_to_idx = class_to_idx
+        self.use_clahe = use_clahe
 
         # 加载人脸-指纹映射
         if mapping_file:
@@ -158,14 +169,14 @@ class FusionDataset(Dataset):
                                 if img_name.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
                                     fp_image_paths.append(os.path.join(hand_dir, img_name))
 
-            # 为每个人脸图像配对指纹图像
+            # 确定性配对：一一对应配对，不使用循环配对（避免随机配对导致标签混淆）
             if face_image_paths and fp_image_paths:
                 num_pairs = min(len(face_image_paths), len(fp_image_paths))
+                # 固定配对：第 i 个人脸配对第 i 个指纹
                 for i in range(num_pairs):
-                    fp_idx = i % len(fp_image_paths)
                     all_samples.append({
                         'face_path': face_image_paths[i],
-                        'fingerprint_path': fp_image_paths[fp_idx],
+                        'fingerprint_path': fp_image_paths[i],
                         'face_id': face_id,
                         'fingerprint_id': fp_id,
                         'label': label
@@ -260,11 +271,20 @@ class FusionDataset(Dataset):
             sample['label'] = self.class_to_idx[sample['label']]
 
     def _create_gallery_query_split(self, samples, split_name='val'):
-        """Create Gallery/Query split for val or test set (1:N retrieval)."""
+        """Create Gallery/Query split for val or test set (1:N retrieval).
+
+        Uses random shuffle (seed = self.seed + 200) for reproducibility.
+        This ensures Gallery is NOT always the same images per person,
+        eliminating systematic bias that could inflate or deflate metrics.
+        """
         from collections import defaultdict
         person_to_samples = defaultdict(list)
         for sample in samples:
             person_to_samples[sample['face_id']].append(sample)
+
+        # 固定随机种子，保证 Gallery/Query 划分可复现
+        # 使用 seed+200 与 train/val split 的 seed 区分开
+        random.seed(self.seed + 200)
 
         gallery_paths = []
         gallery_labels = []
@@ -275,9 +295,10 @@ class FusionDataset(Dataset):
         query_person_ids = []
 
         for person_id, person_samples in person_to_samples.items():
-            sorted_samples = sorted(person_samples, key=lambda x: x['face_path'])
-            gallery = sorted_samples[:self.gallery_per_person]
-            query = sorted_samples[self.gallery_per_person:]
+            shuffled = list(person_samples)
+            random.shuffle(shuffled)
+            gallery = shuffled[:self.gallery_per_person]
+            query = shuffled[self.gallery_per_person:]
 
             for s in gallery:
                 gallery_paths.append((s['face_path'], s['fingerprint_path']))
@@ -302,6 +323,61 @@ class FusionDataset(Dataset):
             f"Query: {len(query_paths)} pairs"
         )
 
+    def get_query_loader(self, batch_size=32, num_workers=0):
+        """返回一个只包含 Query 样本的 DataLoader。
+
+        Gallery 和 Query 来自不同的人（Gallery 样本不参与 Query 检索），
+        因此验证时必须分别提取两者的特征，再计算相似度矩阵。
+        本方法支持 Gallery/Query 分离的检索场景（如消融验证）。
+        """
+        query_paths = getattr(self, f'{self.mode}_query_paths', None)
+        query_labels = getattr(self, f'{self.mode}_query_labels', None)
+        if not query_paths:
+            return None
+
+        query_samples = []
+        for (face_path, fp_path), label in zip(query_paths, query_labels):
+            query_samples.append({
+                'face_path': face_path,
+                'fingerprint_path': fp_path,
+                'label': label,
+            })
+
+        class _QueryDataset(Dataset):
+            def __init__(self, samples, face_transform, fp_transform):
+                self.samples = samples
+                self.face_transform = face_transform
+                self.fp_transform = fp_transform
+
+            def __len__(self):
+                return len(self.samples)
+
+            def __getitem__(self, idx):
+                s = self.samples[idx]
+                face_img = Image.open(s['face_path']).convert('RGB')
+                fp_img = Image.open(s['fingerprint_path']).convert('RGB')
+                if self.face_transform:
+                    face_img = self.face_transform(face_img)
+                if self.fp_transform:
+                    fp_img = self.fp_transform(fp_img)
+                return {
+                    'face_image': face_img,
+                    'fingerprint_image': fp_img,
+                    'label': s['label'],
+                }
+
+        face_t = self.transform.get('face_transform') if isinstance(self.transform, dict) else self.transform
+        fp_t = self.transform.get('fp_transform') if isinstance(self.transform, dict) else self.transform
+
+        return DataLoader(
+            _QueryDataset(query_samples, face_t, fp_t),
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=False,
+        )
+
     def _get_default_transform(self):
         """获取默认数据变换"""
         aug_params = self.augmentation_params or {}
@@ -319,7 +395,12 @@ class FusionDataset(Dataset):
             if aug_params.get("random_rotation", 10):
                 face_transform_list.append(transforms.RandomRotation(aug_params.get("random_rotation", 10)))
             if aug_params.get("color_jitter", False):
-                face_transform_list.append(transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1))
+                face_transform_list.append(transforms.ColorJitter(
+                    brightness=aug_params.get("color_jitter_brightness", 0.2),
+                    contrast=aug_params.get("color_jitter_contrast", 0.2),
+                    saturation=aug_params.get("color_jitter_saturation", 0.1),
+                    hue=aug_params.get("color_jitter_hue", 0.05),
+                ))
 
             face_transform_list.append(transforms.ToTensor())
             re_prob = float(aug_params.get("random_erasing_prob", 0.0) or 0.0)
@@ -334,7 +415,7 @@ class FusionDataset(Dataset):
             fp_transform_list.append(transforms.Resize((self.fingerprint_image_size, self.fingerprint_image_size)))
 
             if aug_params.get("random_rotation", 5):
-                rot_degrees = 15
+                rot_degrees = int(aug_params.get("random_rotation", 5))
                 fp_transform_list.append(transforms.RandomRotation(rot_degrees))
 
             if aug_params.get("gaussian_blur", True):
@@ -343,7 +424,8 @@ class FusionDataset(Dataset):
             fp_transform_list.append(transforms.ToTensor())
             if re_prob > 0:
                 fp_transform_list.append(transforms.RandomErasing(p=re_prob))
-            fp_transform_list.append(transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]))
+            # 统一使用 ImageNet 归一化（与 FingerprintDataset 和推理 pipeline 一致）
+            fp_transform_list.append(transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
 
             fp_transform = transforms.Compose(fp_transform_list)
         else:
@@ -356,10 +438,21 @@ class FusionDataset(Dataset):
             fp_transform = transforms.Compose([
                 transforms.Resize((self.fingerprint_image_size, self.fingerprint_image_size)),
                 transforms.ToTensor(),
-                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
             ])
 
         return {'face': face_transform, 'fingerprint': fp_transform}
+
+    def _apply_clahe(self, img: Image.Image) -> Image.Image:
+        """对指纹图像应用 CLAHE 增强（每个 worker 独立创建 CLAHE 对象）。"""
+        if not self.use_clahe:
+            return img
+        img_array = np.array(img)
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY) if len(img_array.shape) == 3 else img_array
+        if not hasattr(self, '_clahe_cached'):
+            self._clahe_cached = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE_SIZE)
+        enhanced = self._clahe_cached.apply(gray)
+        return Image.fromarray(cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB))
 
     def __len__(self):
         return len(self.samples)
@@ -375,6 +468,8 @@ class FusionDataset(Dataset):
 
         try:
             fp_image = Image.open(sample['fingerprint_path']).convert('RGB')
+            # 应用 CLAHE 增强指纹脊线（训练和验证都应用，与 FingerprintDataset 一致）
+            fp_image = self._apply_clahe(fp_image)
         except Exception as e:
             print(f"加载指纹图像失败 {sample['fingerprint_path']}: {e}")
             fp_image = Image.new('RGB', (self.fingerprint_image_size, self.fingerprint_image_size), (128, 128, 128))

@@ -24,10 +24,9 @@ logger = logging.getLogger("FusionInferencer")
 class FusionInferencer:
     """融合特征提取推理器（人脸 + 指纹）
 
-    支持三种融合策略：
+    支持两种融合策略：
     - simple:    加权求和（可学习权重）
     - adaptive:  注意力自适应融合
-    - gated:    门控融合（论文常用方案）
     """
 
     def __init__(self, model_loader: ModelLoader):
@@ -50,7 +49,7 @@ class FusionInferencer:
 
     def _get_fusion_model(
         self,
-        method: Literal["simple", "adaptive", "gated", "hierarchical"]
+        method: Literal["simple", "adaptive"]
     ) -> torch.nn.Module:
         if method not in self._fusion_models:
             self._fusion_models[method] = self.loader.load_fusion_model(method=method)
@@ -60,7 +59,7 @@ class FusionInferencer:
         self,
         face_image,
         fp_image,
-        method: Literal["simple", "adaptive", "gated"] = "simple",
+        method: Literal["simple", "adaptive"] = "simple",
     ) -> dict:
         """分别提取人脸和指纹特征（不进行融合，用于融合识别前的独立置信度计算）
 
@@ -78,62 +77,123 @@ class FusionInferencer:
         }
 
     @torch.no_grad()
-    def extract_fused(
+    def project_to_fusion_space(
         self,
-        face_image,
-        fp_image,
-        method: Literal["simple", "adaptive", "gated", "hierarchical"] = "simple",
+        face_feature: np.ndarray,
+        fp_feature: np.ndarray,
+        method: Literal["simple", "adaptive"] = "simple",
     ) -> np.ndarray:
-        """提取融合特征向量（512 维）
+        """将单模态或双模态特征投影到融合空间（256-d）
 
-        Args:
-            face_image: 人脸图像
-            fp_image: 指纹图像
-            method: 融合策略
-
-        Returns:
-            归一化融合特征向量 [256] 或 [512]（取决于 fusion_dim）
+        当缺失某个模态时，传入对应零向量即可。
+        融合模型会学习降低缺失模态的权重。
         """
-        face_tensor = self.face_inferencer.preprocess_image(face_image).to(self.loader.device)
-        fp_tensor = self.fp_inferencer.preprocess_image(fp_image).to(self.loader.device)
+        embedding_dim = self.loader.embedding_dim
 
-        face_emb = self.face_inferencer.model.extract_features(face_tensor)
-        fp_emb = self.fp_inferencer.model.extract_features(fp_tensor)
+        face_t = (
+            torch.from_numpy(face_feature).float().to(self.loader.device)
+            if face_feature is not None and np.any(face_feature != 0)
+            else torch.zeros(1, embedding_dim, device=self.loader.device)
+        )
+        fp_t = (
+            torch.from_numpy(fp_feature).float().to(self.loader.device)
+            if fp_feature is not None and np.any(fp_feature != 0)
+            else torch.zeros(1, embedding_dim, device=self.loader.device)
+        )
+
+        if face_t.dim() == 1:
+            face_t = face_t.unsqueeze(0)
+        if fp_t.dim() == 1:
+            fp_t = fp_t.unsqueeze(0)
 
         fusion_model = self._get_fusion_model(method)
-        fused = fusion_model.extract_fused_features(face_emb, fp_emb)
+        fused = fusion_model.extract_fused_features(face_t, fp_t)
         fused = F.normalize(fused, p=2, dim=1).squeeze().cpu().numpy()
+        return fused
+
+    @torch.no_grad()
+    def project_gallery_to_fusion_space(
+        self,
+        gallery_features: list[np.ndarray],
+        modality: Literal["face", "fingerprint"],
+        method: Literal["simple", "adaptive"] = "simple",
+    ) -> np.ndarray:
+        """批量将 Gallery 特征投影到融合空间
+
+        缺失的模态以零向量替代。
+        """
+        if not gallery_features:
+            return np.array([])
+
+        embedding_dim = self.loader.embedding_dim
+        fusion_model = self._get_fusion_model(method)
+
+        feats = np.array([np.asarray(f, dtype=np.float32).flatten() for f in gallery_features])
+        feats_t = torch.from_numpy(feats).float().to(self.loader.device)
+
+        if modality == "face":
+            zeros_t = torch.zeros(feats_t.shape[0], embedding_dim, device=self.loader.device)
+            fused = fusion_model.extract_fused_features(feats_t, zeros_t)
+        else:
+            zeros_t = torch.zeros(feats_t.shape[0], embedding_dim, device=self.loader.device)
+            fused = fusion_model.extract_fused_features(zeros_t, feats_t)
+
+        fused = F.normalize(fused, p=2, dim=1).cpu().numpy()
         return fused
 
     def extract_all(
         self,
         face_image,
         fp_image,
-        method: Literal["simple", "adaptive", "gated", "hierarchical"] = "simple",
+        method: Literal["simple", "adaptive"] = "simple",
     ) -> dict:
         """同时提取人脸特征、指纹特征和融合特征
+
+        支持单模态输入：
+            - 仅传人脸 → 指纹以零向量替代
+            - 仅传指纹 → 人脸以零向量替代
+            - 双模态 → 完整融合
 
         Returns:
             {
                 "face_embedding":  [512] numpy,
                 "fp_embedding":    [512] numpy,
                 "fused_embedding": [256/512] numpy,
-                "face_tensor":      torch.Tensor,
-                "fp_tensor":       torch.Tensor,
+                "modality": "fusion" | "face_only" | "fingerprint_only",
             }
         """
-        face_tensor = self.face_inferencer.preprocess_image(face_image).to(self.loader.device)
-        fp_tensor = self.fp_inferencer.preprocess_image(fp_image).to(self.loader.device)
+        embedding_dim = self.loader.embedding_dim
 
-        face_emb = self.face_inferencer.model.extract_features(face_tensor)
-        fp_emb = self.fp_inferencer.model.extract_features(fp_tensor)
+        # 人脸特征提取（None 时用零向量）
+        if face_image is not None:
+            face_tensor = self.face_inferencer.preprocess_image(face_image).to(self.loader.device)
+            face_emb_raw = self.face_inferencer.model.extract_features(face_tensor)
+        else:
+            face_emb_raw = torch.zeros(1, embedding_dim, device=self.loader.device)
 
+        # 指纹特征提取（None 时用零向量）
+        if fp_image is not None:
+            fp_tensor = self.fp_inferencer.preprocess_image(fp_image).to(self.loader.device)
+            fp_emb_raw = self.fp_inferencer.model.extract_features(fp_tensor)
+        else:
+            fp_emb_raw = torch.zeros(1, embedding_dim, device=self.loader.device)
+
+        # 统一走融合模型
         fusion_model = self._get_fusion_model(method)
-        fused = fusion_model.extract_fused_features(face_emb, fp_emb)
+        fused = fusion_model.extract_fused_features(face_emb_raw, fp_emb_raw)
         fused = F.normalize(fused, p=2, dim=1)
 
+        # 模态标记
+        if face_image is not None and fp_image is not None:
+            modality = "fusion"
+        elif face_image is not None:
+            modality = "face_only"
+        else:
+            modality = "fingerprint_only"
+
         return {
-            "face_embedding": F.normalize(face_emb, p=2, dim=1).squeeze().cpu().numpy(),
-            "fp_embedding": F.normalize(fp_emb, p=2, dim=1).squeeze().cpu().numpy(),
+            "face_embedding": F.normalize(face_emb_raw, p=2, dim=1).squeeze().cpu().numpy(),
+            "fp_embedding": F.normalize(fp_emb_raw, p=2, dim=1).squeeze().cpu().numpy(),
             "fused_embedding": fused.squeeze().cpu().numpy(),
+            "modality": modality,
         }

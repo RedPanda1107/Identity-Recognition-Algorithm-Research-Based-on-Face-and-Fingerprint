@@ -6,7 +6,7 @@ import logging
 from functools import lru_cache
 from typing import Optional
 
-from .config import (
+    from ..config import (
     DEVICE, MODEL_CHECKPOINT_DIR, MODEL_NUM_CLASSES,
     MODEL_EMBEDDING_DIM, MODEL_FUSION_DIM, GALLERY_DIR,
 )
@@ -22,6 +22,8 @@ def get_feature_service():
         device=DEVICE,
         checkpoint_dir=MODEL_CHECKPOINT_DIR,
         num_classes=MODEL_NUM_CLASSES,
+        embedding_dim=MODEL_EMBEDDING_DIM,
+        fusion_dim=MODEL_FUSION_DIM,
     )
     logger.info("[Dependency] FeatureService created")
     return service

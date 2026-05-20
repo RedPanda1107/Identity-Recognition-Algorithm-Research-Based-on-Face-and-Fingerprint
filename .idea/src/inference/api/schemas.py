@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 class RegisterRequest(BaseModel):
     user_id: str = Field(..., description="用户 ID", min_length=1, max_length=64)
+    name: str = Field(..., description="用户姓名")
     face_image: Optional[str] = Field(None, description="人脸图片 Base64 编码")
     face_image_path: Optional[str] = Field(None, description="人脸图片路径（二选一）")
     fingerprint_image: Optional[str] = Field(None, description="指纹图片 Base64 编码")
@@ -17,8 +18,9 @@ class RegisterRequest(BaseModel):
 class RegisterResponse(BaseModel):
     success: bool
     user_id: str
+    name: str
     message: str
-    gallery_updated: bool
+    gallery_updated: bool = True
 
 
 class RecognizeRequest(BaseModel):
@@ -27,10 +29,16 @@ class RecognizeRequest(BaseModel):
     fingerprint_image: Optional[str] = Field(None, description="指纹图片 Base64 编码")
     fingerprint_image_path: Optional[str] = Field(None, description="指纹图片路径（二选一）")
     top_k: int = Field(5, ge=1, le=20, description="返回前 k 个候选")
-    fusion_method: str = Field("simple", description="融合方法: simple / adaptive / gated")
+    fusion_method: str = Field("simple", description="融合方法: simple / adaptive")
     fusion_weight_face: float = Field(0.5, ge=0.0, le=1.0)
     fusion_weight_fp: float = Field(0.5, ge=0.0, le=1.0)
     score_threshold: float = Field(0.0, ge=0.0, le=1.0)
+
+    @validator("face_image", "fingerprint_image", "face_image_path", "fingerprint_image_path")
+    def _empty_to_none(cls, v):
+        if v == "":
+            return None
+        return v
 
 
 class Candidate(BaseModel):
@@ -43,11 +51,13 @@ class RecognizeResponse(BaseModel):
     success: bool
     matched: bool
     user_id: Optional[str] = None
+    name: Optional[str] = None
     confidence: Optional[float] = None
     face_confidence: Optional[float] = None
     fingerprint_confidence: Optional[float] = None
+    face_image: Optional[str] = None
     candidates: List[Candidate] = []
-    modality: str
+    modality: str = "fusion"
     fusion_method: Optional[str] = None
 
 

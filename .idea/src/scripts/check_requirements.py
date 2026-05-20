@@ -36,8 +36,7 @@ from typing import Optional, Dict, Any, List
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 GALLERY_FEATURES_DIR = PROJECT_ROOT / "data" / "gallery" / "features"
 GALLERY_IMAGES_DIR = PROJECT_ROOT / "data" / "gallery" / "images"
-CHECKPOINTS_DIR = PROJECT_ROOT / "checkpoints"
-SCRIPTS_CKPT_DIR = PROJECT_ROOT / "scripts" / "checkpoints"
+OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 MAPPING_FILE = PROJECT_ROOT / "data" / "face_casia_mapping.json"
 BACKEND_DEFAULT_URL = "http://localhost:8000/health"
 
@@ -263,48 +262,43 @@ class RequirementsChecker:
             )
 
     def check_model_files(self) -> CheckResult:
-        """模型文件完整性检测"""
-        # 融合模型：检查 checkpoints/ 和 scripts/checkpoints/ 两个路径
-        fusion_patterns = ["best_simple.pth", "best_gated.pth", "best_adaptive.pth", "best_hierarchical.pth"]
+        """模型文件完整性检测
+
+        搜索 outputs/ 目录下所有 best.pth 融合模型。
+        """
+        fusion_patterns = ["best.pth"]
         found_models: Dict[str, List[str]] = {}
         missing_models: List[str] = []
 
-        for pattern in fusion_patterns:
-            found_in_ckpt = self._find_file(CHECKPOINTS_DIR, pattern)
-            found_in_scripts = self._find_file(SCRIPTS_CKPT_DIR, pattern)
-            found = found_in_ckpt + found_in_scripts
-            key = pattern.replace("best_", "").replace(".pth", "")
-            if found:
-                found_models[key] = [str(p) for p in found]
-            else:
-                missing_models.append(key)
+        # 在 outputs/ 下搜索所有 best.pth
+        found = self._find_file(OUTPUTS_DIR, "best.pth")
+        if found:
+            # 按实验名称组织
+            for p in found:
+                rel = p.relative_to(OUTPUTS_DIR)
+                key = str(rel.parent.name)  # e.g. "fusion_adaptive_full"
+                if key not in found_models:
+                    found_models[key] = []
+                found_models[key].append(str(p))
+        else:
+            missing_models = ["best.pth (任意融合实验)"]
 
         info = {
-            "checkpoints_dir": str(CHECKPOINTS_DIR),
-            "scripts_ckpt_dir": str(SCRIPTS_CKPT_DIR),
+            "outputs_dir": str(OUTPUTS_DIR),
             "found": found_models,
             "missing": missing_models,
         }
 
-        total_found = sum(len(v) for v in found_models.values())
-        total_expected = len(fusion_patterns)
-
-        if total_found == 0:
+        if not found_models:
             return CheckResult(
                 "fail",
-                f"未找到任何融合模型文件（期望 {total_expected} 个）。"
+                f"未找到任何融合模型 best.pth（搜索目录: {OUTPUTS_DIR}）。"
                 "请先执行训练: python scripts/train_fusion.py",
-                info
-            )
-        elif missing_models:
-            return CheckResult(
-                "warn",
-                f"找到 {total_found}/{total_expected} 个模型，缺失: {', '.join(missing_models)}",
                 info
             )
         return CheckResult(
             "pass",
-            f"找到 {total_found}/{total_expected} 个融合模型文件",
+            f"找到 {len(found_models)} 个融合模型: {list(found_models.keys())}",
             info
         )
 

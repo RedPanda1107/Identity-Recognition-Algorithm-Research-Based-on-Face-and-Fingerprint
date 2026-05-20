@@ -103,22 +103,39 @@ class GalleryManager:
         face_file = self.gallery_dir / "features" / "face_features.json"
         fp_file = self.gallery_dir / "features" / "fingerprint_features.json"
 
-        for path, feature_key in [(face_file, "face_feature"), (fp_file, "fingerprint_feature")]:
-            data = dict(self._data)
-            users_out = {}
-            for uid, udata in data["users"].items():
-                users_out[uid] = {k: v for k, v in udata.items() if k != feature_key}
-                users_out[uid][feature_key] = udata.get(feature_key, [])
-            data["users"] = users_out
+        # 分别保存人脸和指纹特征到独立文件（避免相互覆盖）
+        # face_features.json 只含 face_feature
+        face_out = dict(self._data)
+        face_out["users"] = {}
+        for uid, udata in self._data["users"].items():
+            face_out["users"][uid] = {
+                "registered_at": udata.get("registered_at"),
+                "updated_at": udata.get("updated_at"),
+                "name": udata.get("name"),
+                "face_feature": udata.get("face_feature", []),
+            }
+        with open(face_file, "w", encoding="utf-8") as f:
+            json.dump(face_out, f, ensure_ascii=False, indent=2)
 
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+        # fingerprint_features.json 只含 fingerprint_feature
+        fp_out = dict(self._data)
+        fp_out["users"] = {}
+        for uid, udata in self._data["users"].items():
+            fp_out["users"][uid] = {
+                "registered_at": udata.get("registered_at"),
+                "updated_at": udata.get("updated_at"),
+                "name": udata.get("name"),
+                "fingerprint_feature": udata.get("fingerprint_feature", []),
+            }
+        with open(fp_file, "w", encoding="utf-8") as f:
+            json.dump(fp_out, f, ensure_ascii=False, indent=2)
 
         logger.info(f"[Gallery] Saved to {self.gallery_dir}")
 
     def register_user(
         self,
         user_id: str,
+        name: Optional[str] = None,
         face_feature: Optional[np.ndarray] = None,
         fingerprint_feature: Optional[np.ndarray] = None,
         face_image_path: Optional[str] = None,
@@ -128,6 +145,7 @@ class GalleryManager:
 
         Args:
             user_id: 用户 ID
+            name: 用户姓名（前端展示用）
             face_feature: 人脸 512 维特征向量
             fingerprint_feature: 指纹 512 维特征向量
             face_image_path: 人脸图片路径（可选）
@@ -148,6 +166,8 @@ class GalleryManager:
         user = self._data["users"][user_id]
         user["updated_at"] = now
 
+        if name is not None:
+            user["name"] = name
         if face_feature is not None:
             user["face_feature"] = face_feature.tolist() if hasattr(face_feature, "tolist") else list(face_feature)
         if fingerprint_feature is not None:
@@ -196,19 +216,35 @@ class GalleryManager:
 
         Args:
             modality: "face" | "fingerprint" | "both"
+                      "both" 时返回拼接的特征向量（需确保两个模态的特征维度相同）
 
         Returns:
             ([features], [user_ids]) 两个等长列表
         """
         features = []
         ids = []
-        feature_key = "face_feature" if modality == "face" else "fingerprint_feature"
 
         for uid, udata in self._data["users"].items():
-            feat = udata.get(feature_key)
-            if feat is not None and len(feat) > 0:
-                features.append(np.array(feat, dtype=np.float32))
-                ids.append(uid)
+            if modality == "face":
+                feat = udata.get("face_feature")
+                if feat is not None and len(feat) > 0:
+                    features.append(np.array(feat, dtype=np.float32))
+                    ids.append(uid)
+            elif modality == "fingerprint":
+                feat = udata.get("fingerprint_feature")
+                if feat is not None and len(feat) > 0:
+                    features.append(np.array(feat, dtype=np.float32))
+                    ids.append(uid)
+            elif modality == "both":
+                face_feat = udata.get("face_feature")
+                fp_feat = udata.get("fingerprint_feature")
+                if face_feat is not None and len(face_feat) > 0:
+                    if fp_feat is not None and len(fp_feat) > 0:
+                        combined = np.concatenate([face_feat, fp_feat], axis=0)
+                        features.append(combined.astype(np.float32))
+                        ids.append(uid)
+                    else:
+                        logger.warning(f"[Gallery] User {uid} missing fingerprint, skipping in 'both' mode")
 
         return features, ids
 

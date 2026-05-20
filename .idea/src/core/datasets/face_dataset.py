@@ -296,7 +296,10 @@ class FaceDataset(Dataset):
                 transform_list.append(transforms.RandomRotation(aug_params.get("random_rotation", 10)))
             if aug_params.get("color_jitter", False):
                 transform_list.append(transforms.ColorJitter(
-                    brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1
+                    brightness=aug_params.get("color_jitter_brightness", 0.2),
+                    contrast=aug_params.get("color_jitter_contrast", 0.2),
+                    saturation=aug_params.get("color_jitter_saturation", 0.1),
+                    hue=aug_params.get("color_jitter_hue", 0.05),
                 ))
 
             transform_list.append(transforms.ToTensor())

@@ -6,10 +6,21 @@ training:
   batch_size: 16  # 减小 batch size 以适应 6GB GPU（同时训练3个ResNet50）
   accumulation_steps: 2  # 梯度累积步数，实际 batch = 16*2=32
   learning_rate: 1e-4
+  backbone_lr: 1e-5
+  fusion_lr: 5e-4  # 融合层专用学习率（高于 backbone）
   weight_decay: 1e-4
-  freeze_backbone: false  # 训练backbone
+  freeze_backbone: false  # 冻结backbone，投影层默认解冻（由 freeze_projection 控制）
+  freeze_projection: false  # 路径一：解冻投影层，给 attention 学习空间
   label_smoothing: 0.1
   use_amp: true  # 启用混合精度训练节省显存
+  # 模态腐败策略（路径一核心）
+  # 'clean' | 'face_dropout' | 'fp_corruption' | 'both'
+  modality_drop_strategy: 'both'
+  face_dropout_prob: 0.15  # 每 batch 有 15% 概率丢弃整个人脸模态
+  fp_corruption_prob: 0.15  # 每 batch 有 15% 概率腐蚀指纹模态（乘0.7+噪声）
+  entropy_penalty_weight: 5.0  # Attention 权重均衡正则化（直接惩罚偏离 0.5）
+  balance_lr: 0.1              # logits_bias 独立优化器学习率
+  balance_weight_decay: 2.0     # logits_bias L2 正则，驱动权重趋向 0.5/0.5
 
 model:
   face_embedding_dim: 512
@@ -28,11 +39,20 @@ data:
   split_ratio: 0.8           # Person-wise 划分：80% 训练 20% 剩余人员
   test_split_ratio: 0.5     # 剩余人员中 50% 验证 50% 测试 (最终: 70%训练 10%验证 20%测试)
   gallery_per_person: 3        # 验证/测试集 Gallery 每人的图片数
+  use_clahe: true             # 指纹 CLAHE 增强（与 FingerprintDataset 一致）
   augmentation:
+    # 轻度增强（Light）：仅水平翻转(p=0.5) + ±5° 旋转
+    # 对比说明：
+    #   None  : 无增强（baseline）
+    #   Light : 水平翻转(p=0.5) + 旋转±5°（当前配置）
+    #   Medium: 翻转 + 旋转±10° + ColorJitter + RandomErasing 0.2
     random_horizontal_flip: true
-    random_rotation: 10
-    color_jitter: false
-    random_erasing_prob: 0.0
+    random_rotation: 5          # 原有10° → 降至5°
+    color_jitter: false         # 原有true → 关闭
+    color_jitter_brightness: 0.0
+    color_jitter_contrast: 0.0
+    random_erasing_prob: 0.0    # 原有0.2 → 关闭
+    random_resized_crop: false   # 原有true → 关闭
 
 paths:
   data_dir: 'D:/VSpro/1.0/.idea/src/data'
@@ -41,6 +61,10 @@ paths:
   mapping_file: 'D:/VSpro/1.0/.idea/src/data/face_casia_mapping.json'
   pretrained_face: ''
   pretrained_fingerprint: ''
+  pretrained_face_dir: 'D:/VSpro/1.0/.idea/src/outputs/face/checkpoints/face_recognition/face'
+  pretrained_fingerprint_dir: 'D:/VSpro/1.0/.idea/src/outputs/fingerprint/checkpoints/fingerprint_recognition/fingerprint'
+  checkpoint_dir: 'D:/VSpro/1.0/.idea/src/outputs/fusion'
+  log_dir: 'D:/VSpro/1.0/.idea/src/outputs/fusion'
 
 misc:
   seed: 42

@@ -510,15 +510,39 @@ def save_biometric_results(biometric_results, save_path):
 
 
 def set_seed(seed=42):
-    """设置随机种子以确保可重现性"""
+    """设置随机种子以确保实验完全可重现
+
+    涵盖: Python random, NumPy, PyTorch (CPU/GPU), CUDA cudnn
+    关键: 设置 cudnn.benchmark=False 确保每次选择相同的卷积算法
+    """
     import random
     random.seed(seed)
+    np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
+
+    # ── cuDNN 确定性 ────────────────────────────────────────────
+    # benchmark=True 时 cuDNN 会选择最快的算法，但不同硬件/GPU版本结果可能不同
+    # benchmark=False 时 cuDNN 使用确定性算法，保证可重现
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+    # ── PyTorch 确定性运算（2.4+ 新增，更严格）───────────────
+    # 强制 PyTorch 使用确定性实现（非确定性操作会抛出错误或回退到慢速路径）
+    if hasattr(torch, "use_deterministic_algorithms"):
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except Exception:
+            pass
+
+    # ── cuDNN TF32 控制 ───────────────────────────────────────
+    # TF32 是 Ampere+ GPU 上的快速浮点格式（精度略低）
+    # 为保证完全可重现，关闭 TF32 使用 TF32=False 强制 FP32 计算
+    if hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = False
+    if hasattr(torch.backends.cudnn, "allow_tf32"):
+        torch.backends.cudnn.allow_tf32 = False
 
 
 def get_device(device_str='auto'):

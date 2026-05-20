@@ -119,63 +119,148 @@ def recognize_fingerprint(request: RecognizeRequest):
 
 @router.post("/fusion", response_model=RecognizeResponse)
 def recognize_fusion(request: RecognizeRequest):
-    """人脸+指纹融合识别"""
-    from ..dependencies import get_feature_service, get_gallery_manager, get_matching_service
+    """人脸+指纹融合识别，支持单独人脸或单独指纹
+
+    所有推理路径统一经过融合模型：
+    - 双模态：完整融合
+    - 仅人脸：指纹以零向量注入，融合模型自动降低指纹贡献
+    - 仅指纹：人脸以零向量注入，融合模型自动降低人脸贡献
+
+    Gallery 中的单模态特征在识别时会被投影到融合空间，再做匹配。
+    """
+    from pathlib import Path
+
     feature_service = get_feature_service()
     gallery = get_gallery_manager()
     matching = get_matching_service()
 
-    face_img = _get_image(request, "face_image")
-    fp_img = _get_image(request, "fingerprint_image")
+    face_img = None
+    fp_img = None
 
-    result = feature_service.fusion.extract_all(
+    if request.face_image and request.face_image.strip():
+        face_img = _decode_image(request.face_image)
+    elif request.face_image_path:
+        face_img = _load_image(request.face_image_path)
+
+    if request.fingerprint_image and request.fingerprint_image.strip():
+        fp_img = _decode_image(request.fingerprint_image)
+    elif request.fingerprint_image_path:
+        fp_img = _load_image(request.fingerprint_image_path)
+
+    if face_img is None and fp_img is None:
+        raise HTTPException(status_code=400, detail="face_image 和 fingerprint_image 至少需要提供一个")
+
+    # 统一走融合模型进行特征提取（支持 None 模态）
+    fusion_result = feature_service.fusion.extract_all(
         face_img, fp_img, method=request.fusion_method
     )
+    query_fused = fusion_result["fused_embedding"]
+    modality_tag = fusion_result["modality"]
 
-    face_feat = result["face_embedding"]
-    fp_feat = result["fp_embedding"]
-    fused_feat = result["fused_embedding"]
+    # Gallery 加载
+    gallery_face, ids_face = gallery.get_all_features(modality="face")
+    gallery_fp, ids_fp = gallery.get_all_features(modality="fingerprint")
 
-    gallery_face, ids = gallery.get_all_features(modality="face")
-    gallery_fp, _ = gallery.get_all_features(modality="fingerprint")
-
-    if not gallery_face:
+    if not gallery_face and not gallery_fp:
         raise HTTPException(status_code=400, detail="Gallery 为空，请先注册用户")
-    if len(gallery_fp) != len(gallery_face):
-        raise HTTPException(status_code=400, detail="人脸和指纹 Gallery 大小不一致，请检查数据")
 
-    matching.set_gallery(gallery_face, ids)
-    face_results = matching.match(face_feat, top_k=request.top_k, modality="face")
+    results = []
+    matched_user_id = None
+    confidence = 0.0
+    face_confidence_val = 0.0
+    fp_confidence_val = 0.0
 
-    fusion_weights = (request.fusion_weight_face, request.fusion_weight_fp)
+    if modality_tag == "fusion":
+        # 双模态识别：Gallery 双模态特征分别投影后加权融合匹配
+        if len(gallery_face) != len(gallery_fp):
+            raise HTTPException(status_code=400, detail="人脸和指纹 Gallery 大小不一致，请检查数据")
 
-    results = matching.match_multi_modal(
-        face_feature=face_feat,
-        fp_feature=fp_feat,
-        fused_feature=fused_feat,
-        gallery_face=gallery_face,
-        gallery_fp=gallery_fp,
-        gallery_ids=ids,
-        fusion_weights=fusion_weights,
-        top_k=request.top_k,
-        score_threshold=request.score_threshold,
-    )
-
-    if not results:
-        return RecognizeResponse(
-            success=True, matched=False, candidates=[],
-            modality="fusion", fusion_method=request.fusion_method,
+        fusion_weights = (request.fusion_weight_face, request.fusion_weight_fp)
+        results = matching.match_multi_modal(
+            face_feature=fusion_result["face_embedding"],
+            fp_feature=fusion_result["fp_embedding"],
+            fused_feature=query_fused,
+            gallery_face=gallery_face,
+            gallery_fp=gallery_fp,
+            gallery_ids=ids_face,
+            fusion_weights=fusion_weights,
+            top_k=request.top_k,
+            score_threshold=request.score_threshold,
         )
+        if results:
+            top = results[0]
+            matched_user_id = top["user_id"]
+            confidence = top["confidence"]
+            face_confidence_val = top.get("face_confidence", 0.0)
+            fp_confidence_val = top.get("fingerprint_confidence", 0.0)
 
-    top = results[0]
+    elif modality_tag == "face_only":
+        # 仅人脸：Gallery 人脸投影到融合空间后匹配
+        if not gallery_face:
+            raise HTTPException(status_code=400, detail="Gallery 中没有注册人脸，请先注册带人脸的用户")
+
+        gallery_proj = feature_service.fusion.project_gallery_to_fusion_space(
+            gallery_face, modality="face", method=request.fusion_method
+        )
+        matching.set_gallery(gallery_proj.tolist(), ids_face)
+        results = matching.match(
+            query_fused, top_k=request.top_k, modality="fusion",
+            score_threshold=request.score_threshold
+        )
+        if results:
+            top = results[0]
+            matched_user_id = top["user_id"]
+            confidence = top["confidence"]
+            face_confidence_val = top["confidence"]
+
+    elif modality_tag == "fingerprint_only":
+        # 仅指纹：Gallery 指纹投影到融合空间后匹配
+        if not gallery_fp:
+            raise HTTPException(status_code=400, detail="Gallery 中没有注册指纹，请先注册带指纹的用户")
+
+        gallery_proj = feature_service.fusion.project_gallery_to_fusion_space(
+            gallery_fp, modality="fingerprint", method=request.fusion_method
+        )
+        matching.set_gallery(gallery_proj.tolist(), ids_fp)
+        results = matching.match(
+            query_fused, top_k=request.top_k, modality="fusion",
+            score_threshold=request.score_threshold
+        )
+        if results:
+            top = results[0]
+            matched_user_id = top["user_id"]
+            confidence = top["confidence"]
+            fp_confidence_val = top["confidence"]
+
+    # 填充 name 和 face_image
+    name = None
+    face_image_b64 = None
+    if matched_user_id:
+        user_data = gallery.get_user(matched_user_id)
+        if user_data:
+            name = user_data.get("name")
+            face_img_path = user_data.get("face_image_path")
+            if face_img_path:
+                path = Path(face_img_path)
+                if not path.is_absolute():
+                    project_root = Path(__file__).resolve().parent.parent.parent.parent
+                    path = project_root / face_img_path
+                if path.exists():
+                    with open(path, "rb") as f:
+                        face_image_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    matched = matched_user_id is not None and confidence >= request.score_threshold
+
     return RecognizeResponse(
         success=True,
-        matched=top["confidence"] >= request.score_threshold,
-        user_id=top["user_id"],
-        confidence=top["confidence"],
-        face_confidence=top.get("face_confidence"),
-        fingerprint_confidence=top.get("fingerprint_confidence"),
+        matched=matched,
+        user_id=matched_user_id,
+        name=name,
+        confidence=confidence,
+        face_confidence=face_confidence_val,
+        fingerprint_confidence=fp_confidence_val,
+        face_image=face_image_b64,
         candidates=[Candidate(**{k: v for k, v in r.items() if k != "modality"}) for r in results],
-        modality="fusion",
+        modality=modality_tag,
         fusion_method=request.fusion_method,
     )

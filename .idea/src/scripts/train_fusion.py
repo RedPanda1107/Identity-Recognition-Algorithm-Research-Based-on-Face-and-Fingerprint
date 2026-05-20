@@ -17,6 +17,7 @@ import sys
 import argparse
 import json
 from datetime import datetime
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -39,6 +40,48 @@ EXPERIMENT_MODES = {
     'face_ablation': {'freeze_backbone': False, 'ablate_modality': 'fingerprint'},
     'fp_ablation': {'freeze_backbone': False, 'ablate_modality': 'face'},
 }
+
+def _find_best_checkpoint(ckpt_dir, logger):
+    """从 checkpoint 目录中找出 val_acc 最高的文件路径
+
+    优先查找 best.pth（新版单文件），兼容旧版 best_epoch_*.pth。
+    """
+    if not os.path.isdir(ckpt_dir):
+        logger.warning(f"[Checkpoint] 目录不存在: {ckpt_dir}")
+        return None
+
+    # 新命名：best.pth（始终只保存一个最优）
+    best_pth = os.path.join(ckpt_dir, "best.pth")
+    if os.path.isfile(best_pth):
+        try:
+            ckpt = torch.load(best_pth, map_location='cpu', weights_only=False)
+            val_acc = float(ckpt.get('val_acc', ckpt.get('rank1', -1.0)))
+            logger.info(f"[Checkpoint] 加载最优权重: {best_pth} (val_acc={val_acc:.4f})")
+            return best_pth
+        except Exception:
+            pass
+
+    # 旧命名兼容：best_epoch_*.pth（扫描找最高）
+    files = [f for f in os.listdir(ckpt_dir) if f.startswith('best_epoch_') and f.endswith('.pth')]
+    if not files:
+        logger.warning(f"[Checkpoint] 目录为空，找不到 best.pth: {ckpt_dir}")
+        return None
+
+    best_file = None
+    best_acc = -1.0
+    for f in files:
+        try:
+            ckpt = torch.load(os.path.join(ckpt_dir, f), map_location='cpu', weights_only=False)
+            val_acc = float(ckpt.get('val_acc', ckpt.get('rank1', -1.0)))
+            if val_acc > best_acc:
+                best_acc = val_acc
+                best_file = os.path.join(ckpt_dir, f)
+        except Exception:
+            pass
+
+    if best_file:
+        logger.info(f"[Checkpoint] 自动选择最优权重: {best_file} (val_acc={best_acc:.4f})")
+    return best_file
 
 
 def parse_args():
@@ -63,8 +106,8 @@ def parse_args():
     parser.add_argument("--experiment_name", type=str, default=None)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--fusion_method", type=str, default="simple",
-                       choices=['simple', 'adaptive', 'gated', 'hierarchical'],
-                       help="融合方法：simple/simple, adaptive/注意力, gated/门控, hierarchical/层级")
+                       choices=['simple', 'adaptive'],
+                       help="融合方法：simple/加权融合, adaptive/注意力自适应融合")
     parser.add_argument("--experiment_mode", type=str, default="full",
                        choices=list(EXPERIMENT_MODES.keys()),
                        help="实验模式")
@@ -74,26 +117,34 @@ def parse_args():
                        help="指纹预训练权重（用于fusion_only模式）")
     parser.add_argument("--resume", type=str, default=None,
                        help="Path to checkpoint to resume from")
+    parser.add_argument("--face_dropout_prob", type=float, default=None,
+                       help="训练时以该概率丢弃人脸特征（0.0=禁用, 0.15=15%%丢弃）")
+    parser.add_argument("--fp_corruption_prob", type=float, default=None,
+                       help="训练时以该概率腐蚀指纹特征（0.0=禁用, 0.15=15%%腐蚀）")
+    parser.add_argument("--modality_drop_strategy", type=str, default=None,
+                       choices=['clean', 'face_dropout', 'fp_corruption', 'both'],
+                       help="模态腐败策略")
+    parser.add_argument("--entropy_penalty_weight", type=float, default=0.0,
+                       help="Attention 熵正则系数（0.0=禁用，正值=迫使权重均衡，如0.05）")
+    parser.add_argument("--freeze_projection", action="store_true",
+                       help="冻结投影层（保持恒等映射）")
+    parser.add_argument("--freeze_backbone", action="store_true",
+                       help="冻结 backbone 和投影层，只训练 fusion_layer + classifier")
     return parser.parse_args()
 
 
 def _normalize_paths(config, script_dir):
-    """统一路径解析逻辑"""
-    project_root = os.path.dirname(script_dir)
+    """统一路径解析逻辑（使用 Path 确保跨平台路径一致性）"""
+    project_root = Path(script_dir).parent.resolve()
 
-    # 数据相关路径
-    for key in ['face_data_dir', 'fingerprint_data_dir', 'mapping_file']:
-        if key in config.get('paths', {}):
-            path = config['paths'][key]
-            if path and not os.path.isabs(path):
-                config['paths'][key] = os.path.join(project_root, path.lstrip('./'))
-
-    # 预训练模型路径
-    for key in ['pretrained_face', 'pretrained_fingerprint']:
-        if key in config.get('paths', {}):
-            path = config['paths'][key]
-            if path and not os.path.isabs(path):
-                config['paths'][key] = os.path.join(project_root, path.lstrip('./'))
+    for key in ['face_data_dir', 'fingerprint_data_dir', 'mapping_file',
+                'pretrained_face', 'pretrained_fingerprint',
+                'pretrained_face_dir', 'pretrained_fingerprint_dir',
+                'checkpoint_dir', 'log_dir', 'results_dir', 'visualization_dir']:
+        raw = config.get('paths', {}).get(key, '')
+        if raw:
+            p = Path(raw)
+            config['paths'][key] = str(p if p.is_absolute() else project_root / p)
 
     return config
 
@@ -107,15 +158,21 @@ def main():
     config = _normalize_paths(config, script_dir)
 
     # 获取实验模式配置
-    exp_config = EXPERIMENT_MODES[args.experiment_mode]
     mode_suffix = f"_{args.experiment_mode}" if args.experiment_mode != 'full' else ""
     experiment_name = args.experiment_name or f"fusion_{args.fusion_method}{mode_suffix}"
 
-    # 目录
-    log_dir = os.path.join(script_dir, "logs", experiment_name)
-    ckpt_dir = os.path.join(script_dir, "checkpoints", "fusion", experiment_name)
-    os.makedirs(log_dir, exist_ok=True)
+    # 目录（已由 _normalize_paths 转为绝对 Path，统一用 Path 处理）
+    ckpt_base = config['paths'].get('checkpoint_dir') or str(Path(script_dir).parent / "outputs" / "fusion")
+    log_base = config['paths'].get('log_dir') or str(Path(script_dir).parent / "outputs" / "logs")
+    ckpt_dir = str(Path(ckpt_base) / experiment_name)
+    log_dir = str(Path(log_base) / experiment_name)
+
+    # backbone 预训练权重搜索路径
+    face_ckpt_search_dir = config['paths'].get('pretrained_face_dir') or str(Path(script_dir).parent / "checkpoints" / "face")
+    fp_ckpt_search_dir = config['paths'].get('pretrained_fingerprint_dir') or str(Path(script_dir).parent / "checkpoints" / "fingerprint")
+
     os.makedirs(ckpt_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
 
     # 日志
     logger = setup_logger(experiment_name=experiment_name, log_dir=log_dir,
@@ -125,16 +182,17 @@ def main():
     logger.info(f"=" * 60)
     logger.info(f"实验模式: {args.experiment_mode}")
     if args.experiment_mode == 'fusion_only':
-        logger.info(f"需要预训练权重: face={args.face_ckpt}, fp={args.fp_ckpt}")
+        logger.info(f"冻结backbone，从指定路径加载预训练权重")
+    elif args.experiment_mode == 'full':
+        logger.info(f"训练全部，自动加载单模态 best checkpoint（backbone 可继续微调）")
     elif args.experiment_mode == 'face_ablation':
-        logger.info(f"消融模式: 指纹置零，测试单用人脸")
+        logger.info(f"消融模式：指纹置零，测试单用人脸")
     elif args.experiment_mode == 'fp_ablation':
-        logger.info(f"消融模式: 人脸置零，测试单用指纹")
+        logger.info(f"消融模式：人脸置零，测试单用指纹")
     logger.info(f"=" * 60)
 
     # TensorBoard
     writer = SummaryWriter(log_dir=log_dir) if config.get('misc', {}).get('use_tensorboard', False) else None
-
     seed = config.get('misc', {}).get('seed', 42)
     set_seed(seed)
     device = get_device(args.device)
@@ -145,6 +203,8 @@ def main():
     gallery_per_person = config["data"].get("gallery_per_person", 3)
 
     # 数据集
+    use_clahe = config['data'].get('use_clahe', True)
+
     train_dataset = FusionDataset(
         face_data_dir=config['paths']['face_data_dir'],
         fingerprint_data_dir=config['paths']['fingerprint_data_dir'],
@@ -156,7 +216,8 @@ def main():
         split_ratio=split_ratio,
         test_split_ratio=test_split_ratio,
         gallery_per_person=gallery_per_person,
-        seed=seed
+        seed=seed,
+        use_clahe=use_clahe,
     )
     train_dataset.augmentation_params = config['data'].get('augmentation', {}) or {}
 
@@ -172,7 +233,8 @@ def main():
         test_split_ratio=test_split_ratio,
         gallery_per_person=gallery_per_person,
         class_to_idx=train_dataset.class_to_idx,
-        seed=seed
+        seed=seed,
+        use_clahe=use_clahe,
     )
 
     # 测试集（用于最终评估，仅在训练完成后使用）
@@ -188,7 +250,8 @@ def main():
         test_split_ratio=test_split_ratio,
         gallery_per_person=gallery_per_person,
         class_to_idx=train_dataset.class_to_idx,
-        seed=seed
+        seed=seed,
+        use_clahe=use_clahe,
     )
 
     train_loader = DataLoader(
@@ -210,7 +273,7 @@ def main():
     num_classes = len(train_dataset.class_to_idx)
     logger.info(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}, Classes: {num_classes}")
 
-    # 创建单模态模型
+    # 创建单模态模型（spatial_attention=False 以匹配预训练 checkpoint）
     face_model = create_model(
         'face', num_classes=num_classes,
         embedding_dim=int(config['model'].get('face_embedding_dim', 512)),
@@ -220,17 +283,18 @@ def main():
     fp_model = create_model(
         'fingerprint', num_classes=num_classes,
         embedding_dim=int(config['model'].get('fingerprint_embedding_dim', 512)),
-        pretrained=True
+        pretrained=True,
+        spatial_attention=False   # 必须与 FP checkpoint 一致
     ).to(device)
 
-    # 融合模型 (学术标准: 使用 ArcFace s=64, m=0.5)
+    # 融合模型（使用与单模态一致的 ArcFace 参数：s=30, m=0.35）
     use_arcface = config['model'].get('use_arcface', True)
-    arc_s = float(config['model'].get('arc_s', 64.0))
-    arc_m = float(config['model'].get('arc_m', 0.5))
+    arc_s = float(config['model'].get('arc_s', 30.0))
+    arc_m = float(config['model'].get('arc_m', 0.35))
 
     fusion_model = create_model(
         'fusion',
-        fusion_method=args.fusion_method,
+        fusion_strategy=args.fusion_method,
         face_embedding_dim=int(config['model'].get('face_embedding_dim', 512)),
         fingerprint_embedding_dim=int(config['model'].get('fingerprint_embedding_dim', 512)),
         num_classes=num_classes,
@@ -246,28 +310,72 @@ def main():
     trainable = sum(p.numel() for p in fusion_model.parameters() if p.requires_grad)
     logger.info(f"Fusion model: total={total_params:,}, trainable={trainable:,}")
 
-    # 优化器 - 根据实验模式配置
-    lr = float(config['training']['learning_rate'])
-    wd = float(config['training'].get('weight_decay', 1e-4))
+    # freeze_backbone：命令行参数优先于配置文件
+    ablate_from_mode = EXPERIMENT_MODES[args.experiment_mode]['ablate_modality']
+    freeze_backbone = args.freeze_backbone or config['training'].get('freeze_backbone', False)
+    logger.info(f"[Config] freeze_backbone={freeze_backbone} (cli={args.freeze_backbone}, config={config['training'].get('freeze_backbone', False)})")
+    logger.info(f"[Config] Experiment mode: {args.experiment_mode}, ablate_modality={ablate_from_mode}")
 
-    all_params = list(fusion_model.parameters())
-    if not exp_config['freeze_backbone']:
-        all_params.extend(list(face_model.parameters()))
-        all_params.extend(list(fp_model.parameters()))
-        logger.info("Training: fusion + face + fingerprint backbones")
+    # 优化器 - 差分学习率：backbone 低 LR，fusion head 高 LR
+    backbone_lr = float(config['training'].get('backbone_lr', 1e-5))
+    # 一阶段 fusion 学习率：优先读 fusion_lr，兼容旧的 stage1_fusion_lr
+    fusion_lr = float(config['training'].get('fusion_lr',
+                          config['training'].get('stage1_fusion_lr', 5e-4)))
+    wd = float(config['training'].get('weight_decay', 5e-4))
+
+    param_groups = []
+
+    # Fusion head: 高 LR
+    fusion_params = [p for p in fusion_model.parameters() if p.requires_grad]
+    param_groups.append({'params': fusion_params, 'lr': fusion_lr, '_base_lr': fusion_lr})
+
+    if not freeze_backbone:
+        # Backbone: 低 LR（冻结时不加入优化器）
+        backbone_params = []
+        if face_model:
+            backbone_params.extend([p for p in face_model.parameters() if p.requires_grad])
+        if fp_model:
+            backbone_params.extend([p for p in fp_model.parameters() if p.requires_grad])
+        if backbone_params:
+            param_groups.append({'params': backbone_params, 'lr': backbone_lr, '_base_lr': backbone_lr})
+
+        logger.info(
+            f"Differential LR: backbone={backbone_lr:.0e}, fusion={fusion_lr:.0e}, "
+            f"ratio={fusion_lr/backbone_lr:.0f}x"
+        )
     else:
-        logger.info("Training: fusion only (backbones frozen)")
+        logger.info(f"Training fusion head only (backbones frozen), LR={fusion_lr:.0e}")
 
-    optimizer = optim.AdamW(all_params, lr=lr, weight_decay=wd)
+    optimizer = optim.AdamW(param_groups, lr=fusion_lr, weight_decay=wd)
 
     epochs = int(config['training']['epochs'])
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    warmup_epochs = int(config['training'].get('warmup_epochs', 0))
+    warmup_start_lr = float(config['training'].get('warmup_start_lr', 1e-6))
+    initial_lr = fusion_lr  # warmup 目标 LR
 
-    criterion = nn.CrossEntropyLoss(label_smoothing=float(config['training'].get('label_smoothing', 0.1)))
+    # 统一使用 StepLR
+    scheduler = optim.lr_scheduler.StepLR(
+        optimizer,
+        step_size=int(config['training'].get('scheduler_step', 15)),
+        gamma=float(config['training'].get('scheduler_gamma', 0.1))
+    )
 
-    logger.info(f"Optimizer: AdamW, lr={lr}, wd={wd}, epochs={epochs}")
+    criterion = nn.CrossEntropyLoss(label_smoothing=float(config['training'].get('label_smoothing', 0.0)))
+
+    logger.info(f"Optimizer: AdamW, backbone_lr={backbone_lr}, fusion_lr={fusion_lr}, wd={wd}, epochs={epochs}")
+    drop_strategy = args.modality_drop_strategy if args.modality_drop_strategy else config['training'].get('modality_drop_strategy', 'both')
+    face_dp = args.face_dropout_prob if args.face_dropout_prob is not None else float(config['training'].get('face_dropout_prob', 0.0))
+    fp_cp = args.fp_corruption_prob if args.fp_corruption_prob is not None else float(config['training'].get('fp_corruption_prob', 0.0))
+    if face_dp > 0 or fp_cp > 0:
+        logger.info(f"[ModalityDrop] strategy={drop_strategy}, face_dropout={face_dp}, fp_corruption={fp_cp}")
+    if args.entropy_penalty_weight > 0:
+        logger.info(f"[EntropyPenalty] weight={args.entropy_penalty_weight}")
+    if args.freeze_projection:
+        logger.info(f"[Config] freeze_projection=True (projections frozen, identity preserved)")
 
     # 预训练权重
+    # 消融实验（face_ablation / fp_ablation）：只加载对应单模态的预训练权重
+    # full / fusion_only：加载 face + fp 两个单模态权重
     pretrained_ckpts = None
     if args.face_ckpt or args.fp_ckpt:
         pretrained_ckpts = {}
@@ -275,6 +383,40 @@ def main():
             pretrained_ckpts['face'] = args.face_ckpt
         if args.fp_ckpt:
             pretrained_ckpts['fingerprint'] = args.fp_ckpt
+    elif args.experiment_mode in ('fusion_only', 'full'):
+        pretrained_ckpts = {}
+        if face_ckpt_search_dir:
+            best_face = _find_best_checkpoint(face_ckpt_search_dir, logger)
+            if best_face:
+                pretrained_ckpts['face'] = best_face
+        if fp_ckpt_search_dir:
+            best_fp = _find_best_checkpoint(fp_ckpt_search_dir, logger)
+            if best_fp:
+                pretrained_ckpts['fingerprint'] = best_fp
+        if not pretrained_ckpts:
+            logger.warning("[Fusion] 未找到单模态预训练权重，将从头训练 backbone。"
+                           "建议先运行 train_face.py 和 train_fingerprint.py 训练单模态模型。"
+                           "或通过 --face_ckpt / --fp_ckpt 手动指定。")
+    elif args.experiment_mode == 'face_ablation':
+        # 消融人脸：只加载 face checkpoint 用于 face-only 实验
+        pretrained_ckpts = {}
+        if face_ckpt_search_dir:
+            best_face = _find_best_checkpoint(face_ckpt_search_dir, logger)
+            if best_face:
+                pretrained_ckpts['face'] = best_face
+                logger.info("[Face Ablation] 已加载 face checkpoint，将从 face 权重 fine-tune")
+        if not pretrained_ckpts:
+            logger.warning("[Face Ablation] 未找到 face checkpoint，将从头训练（不建议）")
+    elif args.experiment_mode == 'fp_ablation':
+        # 消融指纹：只加载 fingerprint checkpoint 用于 fp-only 实验
+        pretrained_ckpts = {}
+        if fp_ckpt_search_dir:
+            best_fp = _find_best_checkpoint(fp_ckpt_search_dir, logger)
+            if best_fp:
+                pretrained_ckpts['fingerprint'] = best_fp
+                logger.info("[FP Ablation] 已加载 fingerprint checkpoint，将从 FP 权重 fine-tune")
+        if not pretrained_ckpts:
+            logger.warning("[FP Ablation] 未找到 fingerprint checkpoint，将从头训练（不建议）")
 
     # 训练器
     trainer = FusionTrainer(
@@ -290,39 +432,71 @@ def main():
         device=device,
         logger=logger,
         pretrained_ckpts=pretrained_ckpts,
-        freeze_backbone=exp_config['freeze_backbone'],
+        freeze_backbone=freeze_backbone,
         use_amp=config['training'].get('use_amp', True),
         accumulation_steps=int(config['training'].get('accumulation_steps', 1)),
         seed=seed,
         experiment_mode=args.experiment_mode,
-        ablate_modality=exp_config['ablate_modality'],
-        label_smoothing=float(config['training'].get('label_smoothing', 0.1)),
+        ablate_modality=ablate_from_mode,
+        label_smoothing=float(config['training'].get('label_smoothing', 0.0)),
         tb_writer=writer,
+        face_dropout_prob=face_dp,
+        fp_corruption_prob=fp_cp,
+        modality_drop_strategy=drop_strategy,
+        freeze_projection=args.freeze_projection,
+        entropy_penalty_weight=args.entropy_penalty_weight,
+        balance_lr=float(config['training'].get('balance_lr', 0.1)),
+        balance_weight_decay=float(config['training'].get('balance_weight_decay', 2.0)),
     )
 
-    # 训练循环
-    best_rank1 = 0.0
-    no_improve = 0
+    # 训练历史记录
     patience = int(config.get('misc', {}).get('early_stopping_patience', 15))
+
+    # Classifier Warm-Start: ablation experiments load classifier from corresponding modality
+    face_pretrained = pretrained_ckpts.get('face') if pretrained_ckpts else None
+    fp_pretrained  = pretrained_ckpts.get('fingerprint') if pretrained_ckpts else None
+
+    if args.experiment_mode in ('face_ablation', 'fp_ablation'):
+        ckpt_for_clf = face_pretrained if args.experiment_mode == 'face_ablation' else fp_pretrained
+        if ckpt_for_clf:
+            fusion_model.init_classifier_from_pretrained(ckpt_for_clf, None, device)
+            logger.info("[ClassifierWarmStart] Loaded classifier from " + os.path.basename(os.path.dirname(ckpt_for_clf)))
 
     history = {
         'experiment': experiment_name,
         'experiment_mode': args.experiment_mode,
         'fusion_method': args.fusion_method,
+        'face_dropout_prob': args.face_dropout_prob,
+        'entropy_penalty_weight': args.entropy_penalty_weight,
         'start_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'epochs': []
     }
 
+    # 单阶段训练循环
+    best_rank1 = 0.0
+    no_improve = 0
+
     start_epoch = 0
     if args.resume:
         checkpoint = trainer.load_checkpoint(args.resume)
-        start_epoch = checkpoint.get('current_epoch', 0) + 1
+        start_epoch = checkpoint.get('epoch', 0)
         logger.info(f"Resumed from epoch {start_epoch}")
 
     for epoch in range(start_epoch, epochs):
+        # Warmup
+        if warmup_epochs > 0 and epoch < warmup_epochs:
+            wf = (epoch + 1) / warmup_epochs
+            for pg in optimizer.param_groups:
+                pg['lr'] = pg['_base_lr'] * wf
+            logger.info(
+                f"[Train] Warmup {epoch+1}/{warmup_epochs}, "
+                f"fusion_lr={optimizer.param_groups[0]['lr']:.2e}"
+            )
+
         train_loss, train_acc = trainer.train_epoch(epoch, total_epochs=epochs)
         val_loss, rank1, val_metrics = trainer.validate_epoch(epoch, total_epochs=epochs)
         scheduler.step()
+        trainer.step_balance_scheduler()
 
         history['epochs'].append({
             'epoch': epoch + 1,
@@ -337,9 +511,10 @@ def main():
 
         if rank1 > best_rank1:
             best_rank1 = rank1
-            trainer.save_checkpoint(os.path.join(ckpt_dir, f"best_{args.fusion_method}.pth"),
-                                  is_best=True,
-                                  extra={'epoch': epoch+1, 'rank1': rank1})
+            trainer.save_checkpoint(
+                os.path.join(ckpt_dir, "best.pth"),
+                is_best=True,
+                extra={'epoch': epoch + 1, 'rank1': rank1})
             no_improve = 0
         else:
             no_improve += 1
@@ -354,6 +529,28 @@ def main():
         json.dump(history, f, indent=2, ensure_ascii=False)
 
     logger.info(f"Training complete! Best val Rank-1: {best_rank1:.4f}")
+
+    # ── 自动生成可视化图表 ──────────────────────────────────────────────
+    vis_output_dir = config['paths'].get('results_dir') or config['paths'].get('visualization_dir')
+    if vis_output_dir:
+        try:
+            import subprocess
+            vis_script = os.path.join(project_root, "scripts", "visualize.py")
+            if os.path.exists(vis_script):
+                logger.info(f"[Visualization] Generating charts in {vis_output_dir} ...")
+                os.makedirs(vis_output_dir, exist_ok=True)
+                result = subprocess.run(
+                    [sys.executable, vis_script,
+                     "--logs_dir", log_dir,
+                     "--output_dir", vis_output_dir],
+                    capture_output=True, text=True, timeout=60
+                )
+                if result.returncode == 0:
+                    logger.info("[Visualization] Charts generated successfully.")
+                else:
+                    logger.warning(f"[Visualization] Chart generation failed: {result.stderr[:200]}")
+        except Exception as e:
+            logger.warning(f"[Visualization] Skipped: {e}")
 
     # ── 测试集评估（仅在训练完成后使用一次）──────────────────────────────
     if trainer.test_loader is not None:

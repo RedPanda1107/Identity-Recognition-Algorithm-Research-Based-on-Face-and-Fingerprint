@@ -51,19 +51,14 @@ def parse_args():
 
 def _normalize_paths(config, script_dir):
     """Normalize all paths to be absolute relative to project root."""
-    proj_root = os.path.dirname(os.path.dirname(script_dir))
+    from pathlib import Path
+    proj_root = os.path.dirname(script_dir)  # scripts/ 的 parent 就是项目根 src/
 
-    for key in ["data_dir", "modality_data_dir"]:
-        if key in config.get("paths", {}):
-            path = config["paths"][key]
-            if not os.path.isabs(path):
-                config["paths"][key] = os.path.join(proj_root, path.lstrip('./'))
-
-    for key in ["log_dir", "checkpoint_dir", "results_dir"]:
-        if key in config.get("paths", {}):
-            path = config["paths"][key]
-            if not os.path.isabs(path):
-                config["paths"][key] = os.path.join(script_dir, path.lstrip('./'))
+    for key in list(config.get("paths", {}).keys()):
+        raw = config["paths"][key]
+        if raw:
+            p = Path(raw)
+            config["paths"][key] = str(p if p.is_absolute() else Path(proj_root) / p)
 
 
 def _log_model_info(logger, model, train_dataset, val_dataset, num_classes):
@@ -123,7 +118,7 @@ def _apply_freeze_config(logger, model, optimizer, config, stage_name, freeze_ep
         - Conservative LR for backbone, moderate LR for head
         - Use separate param groups for fine-grained LR control
     """
-    wd = float(config['training'].get('weight_decay', 1e-4))
+    wd = float(config['training'].get('weight_decay', 5e-4))
     if freeze_epochs > 0:
         # Stage 1: Freeze backbone
         model.freeze_until(model.FREEZE_L4)  # Freeze everything except classifier
@@ -134,11 +129,19 @@ def _apply_freeze_config(logger, model, optimizer, config, stage_name, freeze_ep
         )
 
         # Stage 1 optimizer: only trainable params (classifier + projection)
-        optimizer = optim.Adam(
-            filter(lambda p: p.requires_grad, model.parameters()),
-            lr=freeze_learning_rate,
-            weight_decay=wd
-        )
+        opt_name = config['training'].get('optimizer', 'adamw').lower()
+        if 'adam' in opt_name:
+            optimizer = optim.AdamW(
+                filter(lambda p: p.requires_grad, model.parameters()),
+                lr=freeze_learning_rate,
+                weight_decay=wd
+            )
+        else:
+            optimizer = optim.SGD(
+                filter(lambda p: p.requires_grad, model.parameters()),
+                lr=freeze_learning_rate,
+                weight_decay=wd
+            )
         logger.info(f"[{stage_name}] optimizer: LR={freeze_learning_rate:.0e}, "
                     f"仅训练可学习参数")
     else:
@@ -159,10 +162,17 @@ def _apply_freeze_config(logger, model, optimizer, config, stage_name, freeze_ep
             else:
                 backbone_params.append(param)
 
-        optimizer = optim.Adam([
-            {'params': backbone_params, 'lr': unfreeze_lr},
-            {'params': head_params, 'lr': unfreeze_lr * head_lr_ratio},
-        ], weight_decay=wd)
+        opt_name = config['training'].get('optimizer', 'adamw').lower()
+        if 'adam' in opt_name:
+            optimizer = optim.AdamW([
+                {'params': backbone_params, 'lr': unfreeze_lr},
+                {'params': head_params, 'lr': unfreeze_lr * head_lr_ratio},
+            ], weight_decay=wd)
+        else:
+            optimizer = optim.SGD([
+                {'params': backbone_params, 'lr': unfreeze_lr},
+                {'params': head_params, 'lr': unfreeze_lr * head_lr_ratio},
+            ], weight_decay=wd, momentum=0.9)
         logger.info(
             f"[{stage_name}] 分层学习率: backbone={unfreeze_lr:.0e}, "
             f"head={unfreeze_lr * head_lr_ratio:.0e}"
@@ -220,15 +230,20 @@ def main():
     args = parse_args()
     config = load_config(args.config)
 
-    # Setup logger first (before path normalization errors)
+    # 统一路径 + 输出目录结构
     script_dir = os.path.dirname(os.path.abspath(__file__))
     experiment_name = config.get("misc", {}).get("experiment_name", args.experiment_name)
-
     _normalize_paths(config, script_dir)
+
+    ckpt_base = config["paths"]["checkpoint_dir"]
+    log_base = config["paths"]["log_dir"]
+    fig_base = config["paths"]["results_dir"]
+    ckpt_dir = os.path.join(ckpt_base, experiment_name)
+    fig_dir = fig_base  # figures go directly under results_dir (no experiment_name nesting)
 
     logger = setup_logger(
         experiment_name=experiment_name,
-        log_dir=config["paths"].get("log_dir", "./logs"),
+        log_dir=log_base,  # setup_logger will append experiment_name internally
         level="INFO",
         logger_name="FingerprintRecognition"
     )
@@ -277,9 +292,11 @@ def main():
     )
 
     # Check if test set is available
-    has_test = (test_split_ratio < 1.0 and
-                hasattr(test_dataset, 'test_gallery_paths') and
-                test_dataset.test_gallery_paths)
+    has_test_attr = hasattr(test_dataset, 'test_gallery_paths')
+    has_test_paths = bool(test_dataset.test_gallery_paths) if has_test_attr else False
+    has_test = (test_split_ratio < 1.0 and has_test_attr and has_test_paths)
+    logger.info(f"[DEBUG] has_test 检查: test_split_ratio={test_split_ratio}<1.0={test_split_ratio < 1.0}, "
+                f"has_attr={has_test_attr}, test_gallery_paths非空={has_test_paths} → has_test={has_test}")
     if has_test:
         logger.info(
             f"数据集划分: 训练 {len(train_dataset)} 张 / "
@@ -550,9 +567,8 @@ def main():
         if val_acc > best_acc:
             best_acc = val_acc
             no_improve_epochs = 0
-            ckpt_dir = config["paths"].get("checkpoint_dir", "./checkpoints")
             os.makedirs(ckpt_dir, exist_ok=True)
-            ckpt_path = os.path.join(ckpt_dir, "fingerprint", f"best_epoch_{epoch+1}.pth")
+            ckpt_path = os.path.join(ckpt_dir, "fingerprint", "best.pth")
             trainer.save_checkpoint(
                 ckpt_path, is_best=True, extra={
                     "epoch": epoch + 1,
@@ -595,11 +611,8 @@ def main():
         training_history["epochs"].append(epoch_data)
 
     # ── 保存训练历史 ────────────────────────────────────────────────────────────
-    history_dir = os.path.join(
-        config["paths"].get("log_dir", "./logs"), experiment_name
-    )
-    os.makedirs(history_dir, exist_ok=True)
-    history_path = os.path.join(history_dir, "training_history.json")
+    os.makedirs(log_base, exist_ok=True)
+    history_path = os.path.join(log_base, "training_history.json")
     with open(history_path, 'w', encoding='utf-8') as f:
         json.dump(training_history, f, indent=2, ensure_ascii=False, default=str)
 
@@ -609,9 +622,24 @@ def main():
     if has_test:
         logger.info("=" * 60)
         logger.info("开始测试集评估...")
-        test_metrics = trainer.test_epoch(epoch=epoch, total_epochs=epochs, use_amp=use_amp)
-        training_history["test_metrics"] = test_metrics
-        logger.info("测试集评估完成")
+        # 重新加载最佳模型（早停时当前状态不一定是最佳的）
+        best_ckpt_path = os.path.join(ckpt_dir, "fingerprint", "best.pth")
+        if os.path.exists(best_ckpt_path):
+            try:
+                checkpoint = torch.load(best_ckpt_path, map_location=device)
+                model.load_state_dict(checkpoint["model_state"])
+                logger.info(f"[加载] 已加载最佳模型: {best_ckpt_path}")
+            except Exception as e:
+                logger.warning(f"[警告] 加载最佳模型失败: {e}，使用当前模型进行测试")
+        else:
+            logger.warning(f"[警告] 最佳模型不存在: {best_ckpt_path}，使用当前模型进行测试")
+        try:
+            test_metrics = trainer.test_epoch(epoch=epoch, total_epochs=epochs, use_amp=use_amp)
+            training_history["test_metrics"] = test_metrics
+            logger.info("测试集评估完成")
+        except Exception as e:
+            logger.error(f"[错误] 测试评估异常: {e}", exc_info=True)
+            training_history["test_metrics"] = None
     else:
         logger.info("无独立测试集，跳过测试评估")
 
@@ -619,16 +647,16 @@ def main():
 
     # ── 触发可视化 ─────────────────────────────────────────────────────────────
     try:
-        output_dir = config["paths"].get("results_dir", "./results")
-        vis_script = os.path.join(project_root, "scripts", "visualize.py")
+        os.makedirs(fig_dir, exist_ok=True)
+        vis_script = os.path.join(script_dir, "visualize.py")
         subprocess.run(
             [sys.executable, vis_script,
-             "--experiment_dir", history_dir,
-             "--output_dir", output_dir,
+             "--experiment_dir", log_base,
+             "--output_dir", fig_dir,
              "--include_run_seq"],
             check=False
         )
-        logger.info(f"已触发可视化 -> {output_dir}")
+        logger.info(f"Charts generated: {fig_dir}")
     except Exception as e:
         logger.warning(f"触发可视化失败: {e}")
 

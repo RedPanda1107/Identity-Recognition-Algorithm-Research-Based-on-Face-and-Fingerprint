@@ -1,73 +1,53 @@
 # 单模态指纹识别配置文件
 # 专为毕业论文单模态指纹识别实验设计
 #
-# ─────────────────────────────────────────────────────────────────────────────
-# 训练策略说明：
-#   Stage 1 (freeze_epochs)：冻结 backbone，仅训练分类头
-#     → 目标：快速验证数据管道正常，建立可用 baseline
-#   Stage 2 (warmup_epochs)：解冻 backbone，轻量微调
-#     → 目标：让 ResNet50 适应指纹域特征
-#   Stage 3 (metric_epochs)：启用 ArcFace 度量学习（可选）
-#     → 目标：在特征质量良好的基础上做度量约束
-# ─────────────────────────────────────────────────────────────────────────────
+# 统一输出结构：outputs/fingerprint/<experiment_name>/
+#   ├── checkpoints/best.pth
+#   ├── logs/training_history.json
+#   └── figures/training_curves.png
 
-# 训练配置
 training:
-  epochs: 80                     # ArcFace 收敛慢，80 轮保证充分训练
-
-  # === Stage 1: 冻结 backbone ===
-  freeze_epochs: 8              # 冻结阶段缩短（避免在冻结期激活 margin）
-  freeze_learning_rate: 1e-4    # ← 降低 5 倍，让 ArcFace 稳定收敛
-
-  # === Stage 2: 解冻 backbone，轻量微调 ===
-  warmup_epochs: 5               # 解冻后先 warmup 5 轮
-  warmup_start_lr: 1e-6          # 从 1e-6 线性爬升到 unfreeze_lr
-  unfreeze_lr: 5e-5              # ← 更保守的 backbone 微调
-  head_lr_ratio: 5.0             # 解冻后分类头 LR = unfreeze_lr × 5.0 = 2.5e-4
+  epochs: 50
+  batch_size: 32
+  freeze_epochs: 5
+  freeze_learning_rate: 3e-4
+  warmup_epochs: 5
+  warmup_start_lr: 3e-6
+  unfreeze_lr: 3e-4
+  head_lr_ratio: 5.0
   weight_decay: 5e-4
+  optimizer: 'adamw'
+  scheduler_type: 'step'
+  scheduler_step: 15
+  scheduler_gamma: 0.1
+  label_smoothing: 0.0
+  metric_learning: true
+  arc_s: 30.0
+  arc_m_start: 0.1
+  arc_m_end: 0.35
+  arc_m_warmup_epochs: 10
+  arc_m_delay_epochs: 3
+  tta: false
+  use_amp: false
 
-  # === Stage 3: ArcFace 度量学习 ===
-  metric_learning: true           # ← 开启 ArcFace
-  arc_s: 30.0                   # scale=30 避免 logits 爆炸
-  arc_m_start: 0.0              # ← 先从 margin=0 开始
-  arc_m_end: 0.35               # ← 最终 margin=0.35（指纹比人脸脆弱，0.5 过于激进）
-  arc_m_warmup_epochs: 25        # ← margin 在 25 轮内从 0 爬升到 0.35
-  arc_m_delay_epochs: 15         # ← 前 15 轮 margin=0，等同普通 Softmax，让模型先学会特征分离
-
-  # === 正则化 & 泛化 ===
-  label_smoothing: 0.1           # 标签平滑，减少过拟合
-  tta: true                      # 测试时增强：验证阶段水平翻转增强
-
-  # === 基础配置 ===
-  batch_size: 32                  # 6GB GPU 建议 32，避免 OOM
-  optimizer: 'adam'
-  scheduler_type: 'step'          # 'step' 或 'plateau'
-  scheduler_step: 20              # StepLR 步长
-  scheduler_gamma: 0.5            # StepLR 衰减因子
-  scheduler_patience: 8           # ReduceLROnPlateau 耐心值
-  scheduler_factor: 0.5           # ReduceLROnPlateau 衰减因子
-
-# 模型配置
 model:
   model_type: 'fingerprint_net'
   embedding_dim: 512
-  num_classes: 500               # 500 人（Person-wise 划分：400 训练 + 100 验证）
-  pretrained: true               # ImageNet 预训练作为初始化
-  dropout_rate: 0.5
-  spatial_attention: false       # 与 face 配置对齐，诊断期间禁用
+  num_classes: 500
+  pretrained: true
+  dropout_rate: 0.3
+  spatial_attention: false
 
-# 数据配置
 data:
   image_size: 224
-  use_augmentation: true          # ← 恢复数据增强
-  use_clahe: true               # ← 开启 CLAHE 增强脊线对比度
-  split_ratio: 0.8                # Person-wise 划分：80% 训练 20% 验证
-  test_split_ratio: 0.5           # 验证集中 50% 用于早停，50% 用于最终测试
-  gallery_per_person: 3           # 验证集 Gallery 每人的图片数
-
+  use_augmentation: true
+  use_clahe: true
+  split_ratio: 0.8
+  test_split_ratio: 0.5
+  gallery_per_person: 3
   augmentation:
-    random_horizontal_flip: false # 指纹有左右手区别
-    random_rotation: 15           # ±15° 旋转（模拟按压偏位）
+    random_horizontal_flip: false
+    random_rotation: 15
     color_jitter: true
     color_jitter_brightness: 0.1
     color_jitter_contrast: 0.1
@@ -75,40 +55,36 @@ data:
     color_jitter_hue: 0.0
     random_crop: false
     random_resized_crop: false
-    random_erasing_prob: 0.1     # 10% 随机遮挡
+    random_erasing_prob: 0.1
     random_erasing_scale: [0.02, 0.15]
-    translate: [0.03, 0.03]      # ±3% 平移
-    scale: [0.97, 1.03]         # 97%-103% 缩放
+    translate: [0.03, 0.03]
+    scale: [0.97, 1.03]
 
-# 路径配置
 paths:
   data_dir: './data'
-  modality_data_dir: 'D:/VSpro/1.0/.idea/src/data/CASIA-FingerprintV5(BMP)'
-  checkpoint_dir: 'D:/VSpro/1.0/.idea/src/checkpoints/fingerprint'
-  log_dir: 'D:/VSpro/1.0/.idea/src/logs/fingerprint'
-  config_dir: 'D:/VSpro/1.0/.idea/src/configs'
-  results_dir: 'D:/VSpro/1.0/.idea/src/results/fingerprint'
+  modality_data_dir: './data/CASIA-FingerprintV5(BMP)'
+  checkpoint_dir: 'outputs/fingerprint/checkpoints'
+  log_dir: 'outputs/fingerprint'
+  results_dir: 'outputs/fingerprint'
+  visualization_dir: 'outputs/fingerprint'
 
-# 其他配置
 misc:
   seed: 42
   num_workers: 0
   save_freq: 5
   log_freq: 10
-  use_amp: false                  # 诊断：关闭 AMP，避免 fp16 CUDA 上下文问题
+  use_amp: false
   experiment_name: 'fingerprint_recognition'
   early_stopping: true
-  early_stopping_patience: 25    # 确认崩溃后迅速停止
-  early_stopping_warmup: 40      # 给模型足够时间走出崩溃阶段
+  early_stopping_patience: 10
+  early_stopping_warmup: 20
 
-# 实验配置
 experiment:
   ablation_study: false
   test_time_augmentation: false
   save_features: false
   evaluate_every_epoch: true
 
-# 调试配置
 debug:
   debug_mode: false
   max_samples: null

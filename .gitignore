@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# PyTorch model checkpoints
+*.pth
+*.pt
+*.ckpt
+
+# Logs
+*.log
+logs/
+
+# Outputs (training results, experiments, figures)
+.idea/src/outputs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Garbage files
+--config

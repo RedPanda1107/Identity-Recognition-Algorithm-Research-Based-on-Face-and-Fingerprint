@@ -6,7 +6,8 @@ POST /api/v1/users/register
 import io
 import base64
 import logging
-from typing import Literal
+import uuid
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 from PIL import Image
@@ -43,6 +44,23 @@ def _load_image(path: str) -> Image.Image:
         raise HTTPException(status_code=400, detail=f"图片加载失败: {e}")
 
 
+def _save_image_to_gallery(image: Image.Image, user_id: str, modality: str, project_root: Path) -> str:
+    """将图片保存到 Gallery 的 images 目录，返回相对路径"""
+    images_dir = project_root / "data" / "gallery" / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    ext = "jpg"
+    filename = f"{user_id}_{modality}.{ext}"
+    filepath = images_dir / filename
+
+    if image.mode == "RGBA":
+        image = image.convert("RGB")
+    image.save(filepath, "JPEG", quality=95)
+    relative_path = str(filepath.relative_to(project_root))
+    logger.info(f"[Register] Saved {modality} image for {user_id} -> {filepath}")
+    return relative_path
+
+
 @router.post("/register", response_model=RegisterResponse)
 def register_user(
     request: RegisterRequest,
@@ -51,31 +69,37 @@ def register_user(
 ):
     """注册新用户或更新已有用户的人脸/指纹特征"""
 
-    if not request.face_image and not request.fingerprint_image and \
-       not request.face_image_path and not request.fingerprint_image_path:
-        raise HTTPException(status_code=400, detail="必须提供 face_image 或 fingerprint_image")
+    face_img = None
+    fp_img = None
+
+    if request.face_image and request.face_image.strip():
+        face_img = _decode_image(request.face_image)
+    elif request.face_image_path:
+        face_img = _load_image(request.face_image_path)
+
+    if request.fingerprint_image and request.fingerprint_image.strip():
+        fp_img = _decode_image(request.fingerprint_image)
+    elif request.fingerprint_image_path:
+        fp_img = _load_image(request.fingerprint_image_path)
+
+    if face_img is None and fp_img is None:
+        raise HTTPException(status_code=400, detail="face_image 和 fingerprint_image 至少需要提供一个")
 
     face_feature = None
     fp_feature = None
     face_path = None
     fp_path = None
 
-    try:
-        if request.face_image:
-            face_img = _decode_image(request.face_image)
-            face_feature = feature_service.extract_face(face_img)
-        elif request.face_image_path:
-            face_img = _load_image(request.face_image_path)
-            face_feature = feature_service.extract_face(face_img)
-            face_path = request.face_image_path
+    project_root = Path(__file__).resolve().parent.parent.parent.parent
 
-        if request.fingerprint_image:
-            fp_img = _decode_image(request.fingerprint_image)
+    try:
+        if face_img is not None:
+            face_feature = feature_service.extract_face(face_img)
+            face_path = _save_image_to_gallery(face_img, request.user_id, "face", project_root)
+
+        if fp_img is not None:
             fp_feature = feature_service.extract_fingerprint(fp_img)
-        elif request.fingerprint_image_path:
-            fp_img = _load_image(request.fingerprint_image_path)
-            fp_feature = feature_service.extract_fingerprint(fp_img)
-            fp_path = request.fingerprint_image_path
+            fp_path = _save_image_to_gallery(fp_img, request.user_id, "fingerprint", project_root)
 
     except HTTPException:
         raise
@@ -85,6 +109,7 @@ def register_user(
 
     result = gallery.register_user(
         user_id=request.user_id,
+        name=request.name,
         face_feature=face_feature,
         fingerprint_feature=fp_feature,
         face_image_path=face_path,
@@ -94,6 +119,7 @@ def register_user(
     return RegisterResponse(
         success=True,
         user_id=request.user_id,
+        name=request.name,
         message=f"用户 {request.user_id} {'注册' if result['is_new'] else '更新'}成功",
         gallery_updated=True,
     )

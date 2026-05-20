@@ -35,26 +35,20 @@ def parse_args():
 
 
 def _normalize_paths(config, script_dir, project_root):
-    """统一路径解析逻辑"""
-    # Log dir
-    log_dir = config["paths"].get("log_dir", os.path.join(script_dir, "logs"))
-    if not os.path.isabs(log_dir):
-        log_dir = os.path.join(script_dir, log_dir.lstrip('./'))
+    """统一路径解析逻辑（使用 Path 确保跨平台路径一致性）"""
+    from pathlib import Path
 
-    # Checkpoint dir
-    ckpt_dir = config["paths"].get("checkpoint_dir", os.path.join(script_dir, "checkpoints"))
-    if not os.path.isabs(ckpt_dir):
-        ckpt_dir = os.path.join(script_dir, ckpt_dir.lstrip('./'))
+    # 所有路径统一转为绝对 Path
+    for key in list(config.get("paths", {}).keys()):
+        raw = config["paths"][key]
+        if raw:
+            p = Path(raw)
+            if not p.is_absolute():
+                config["paths"][key] = str(project_root / p)
+            else:
+                config["paths"][key] = str(p)
 
-    # Data dir (relative to project root)
-    data_dir = config["paths"]["modality_data_dir"]
-    if not os.path.isabs(data_dir):
-        data_dir = os.path.join(project_root, data_dir.lstrip('./'))
-
-    config["paths"]["log_dir"] = log_dir
-    config["paths"]["checkpoint_dir"] = ckpt_dir
-    config["paths"]["data_dir"] = data_dir
-
+    # checkpoint / log / results 最终路径包含 experiment_name（由 caller 传入后覆盖）
     return config
 
 
@@ -65,12 +59,20 @@ def main():
     # Use experiment name from config if available, otherwise use command line argument
     experiment_name = args.experiment_name or config.get("misc", {}).get("experiment_name", "face_recognition")
 
-    # 统一路径解析
+    # 统一路径解析（返回绝对路径基准）
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(script_dir)
     config = _normalize_paths(config, script_dir, project_root)
 
-    logger = setup_logger(experiment_name=experiment_name, log_dir=config["paths"]["log_dir"],
+    # 统一输出目录结构：outputs/<modality>/<experiment_name>/
+    base = config["paths"]["checkpoint_dir"]   # outputs/face
+    log_base = config["paths"]["log_dir"]      # outputs/face
+    fig_base = config["paths"]["results_dir"]  # outputs/face
+
+    ckpt_dir = os.path.join(base, experiment_name)
+    fig_dir = fig_base  # figures go directly under results_dir (no experiment_name nesting)
+
+    logger = setup_logger(experiment_name=experiment_name, log_dir=log_base,  # setup_logger appends experiment_name internally
                           level="INFO", logger_name="FaceRecognition")
 
     seed = config.get("misc", {}).get("seed", 42)
@@ -163,16 +165,18 @@ def main():
     arc_s = float(config["model"].get("arc_s", 30.0))
     arc_m = float(config["model"].get("arc_m", 0.5))
 
-    optimizer_name = config["training"].get("optimizer", "adam").lower()
-    base_lr = float(config["training"].get("learning_rate", 1e-4))
+    optimizer_name = config["training"].get("optimizer", "adamw").lower()
+    base_lr = float(config["training"].get("learning_rate", 3e-5))
     weight_decay = float(config["training"].get("weight_decay", 5e-4))
 
     # Optimizer
-    if optimizer_name == "adam":
-        optimizer = optim.Adam(model.parameters(), lr=base_lr, weight_decay=weight_decay)
-    else:
+    if "adam" in optimizer_name:
+        optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
+    elif optimizer_name == "sgd":
         momentum = float(config["training"].get("momentum", 0.9))
         optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=momentum, weight_decay=weight_decay)
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=base_lr, weight_decay=weight_decay)
 
     # Learning rate scheduler
     scheduler_type = config["training"].get("scheduler_type", "step")
@@ -186,9 +190,7 @@ def main():
             gamma=float(config["training"].get("scheduler_gamma", 0.1))
         )
 
-    # Create FaceTrainer with ArcFace (academic standard: s=64, m=0.5)
-    arc_s = float(config["model"].get("arc_s", 64.0))
-    arc_m = float(config["model"].get("arc_m", 0.5))
+    # Create FaceTrainer with ArcFace (统一配置: s=30, m=0.35)
     label_smoothing = float(config["training"].get("label_smoothing", 0.0))
     tta = bool(config["training"].get("tta", False))
 
@@ -238,10 +240,11 @@ def main():
     for epoch in range(start_epoch, epochs):
         logger.info(f"Epoch {epoch+1}/{epochs}")
 
-        # Warmup: gradually increase learning rate
+        # Warmup: gradually increase learning rate (统一warmup起点 from config)
         if warmup_epochs > 0 and epoch < warmup_epochs:
             warmup_factor = (epoch + 1) / warmup_epochs
-            current_lr = initial_lr * 0.1 + (initial_lr - initial_lr * 0.1) * warmup_factor
+            warmup_start_lr = float(config["training"].get("warmup_start_lr", 3e-6))
+            current_lr = warmup_start_lr + (initial_lr - warmup_start_lr) * warmup_factor
             for param_group in optimizer.param_groups:
                 param_group['lr'] = current_lr
             logger.info(f"Warmup epoch {epoch+1}/{warmup_epochs}, LR: {current_lr:.6f}")
@@ -295,9 +298,8 @@ def main():
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             best_epoch = epoch + 1
-            ckpt_dir = config["paths"].get("checkpoint_dir", "./checkpoints")
             os.makedirs(ckpt_dir, exist_ok=True)
-            ckpt_path = os.path.join(ckpt_dir, "face", f"best_epoch_{epoch+1}.pth")
+            ckpt_path = os.path.join(ckpt_dir, "face", "best.pth")
             trainer.save_checkpoint(ckpt_path, is_best=True, extra={"epoch": epoch + 1, "val_acc": val_acc})
             logger.info(f"[保存] 最佳模型: {ckpt_path} (Val Acc={val_acc:.4f})")
             # reset early stopping counter when improvement observed
@@ -317,7 +319,7 @@ def main():
         logger.info("=" * 70)
 
         # 使用最佳模型进行测试
-        best_ckpt_path = os.path.join(ckpt_dir, "face", f"best_epoch_{best_epoch}.pth")
+        best_ckpt_path = os.path.join(ckpt_dir, "face", "best.pth")
         if os.path.exists(best_ckpt_path):
             checkpoint = torch.load(best_ckpt_path, map_location=device)
             model.load_state_dict(checkpoint["model_state"])
@@ -342,21 +344,23 @@ def main():
         logger.info(f"训练完成! 最佳验证准确率: {best_val_acc:.4f}")
 
     # 保存完整的训练历史
-    history_dir = os.path.join(config["paths"].get("log_dir", "./logs"), experiment_name)
-    os.makedirs(history_dir, exist_ok=True)
-    history_path = os.path.join(history_dir, "training_history.json")
+    os.makedirs(log_base, exist_ok=True)
+    history_path = os.path.join(fig_dir, "training_history.json")
     with open(history_path, 'w', encoding='utf-8') as f:
         json.dump(training_history, f, indent=2, ensure_ascii=False, default=str)
 
     logger.info(f"Training history saved to: {history_path}")
-    # 自动触发可视化（包含序号），非阻塞
+    # 自动触发可视化
     try:
-        output_dir = config["paths"].get("visualization_dir", "./visualization_results")
-        vis_script = os.path.join(project_root, "scripts", "visualize.py")
-        subprocess.run([sys.executable, vis_script, "--experiment_dir", history_dir, "--output_dir", output_dir, "--include_run_seq"], check=False)
-        logger.info(f"Triggered visualization for {experiment_name} -> {output_dir}")
+        os.makedirs(fig_dir, exist_ok=True)
+        vis_script = os.path.join(script_dir, "visualize.py")
+        subprocess.run([sys.executable, vis_script,
+                       "--experiment_dir", log_base,
+                       "--output_dir", fig_dir,
+                       "--include_run_seq"], check=False)
+        logger.info(f"Charts generated: {fig_dir}")
     except Exception as e:
-        logger.warning(f"Failed to trigger visualization: {e}")
+        logger.warning(f"Visualization skipped: {e}")
 
 
 if __name__ == "__main__":

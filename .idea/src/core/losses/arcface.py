@@ -45,6 +45,17 @@ class ArcMarginProduct(nn.Module):
     def forward(self, input, label=None):
         # input is features: (batch_size, embedding_dim)
         # label is (batch_size,) - optional, if None, return raw cosine similarity
+        #
+        # ARCHITECTURE: L2 norm → cos(θ) → angular margin → scale
+        #   Step 1: F.normalize both input and weight
+        #   Step 2: cos(θ) = <W, x> on unit hypersphere
+        #   Step 3: Apply ArcFace additive angular margin cos(θ + m)
+        #   Step 4: Scale logits by s (controls peakiness)
+        #
+        # SATURATION PREVENTION:
+        #   - s=30 (not 64) to keep logits in manageable range
+        #   - m=0.35 (not 0.5) to avoid over-compressing同人 angles
+        #   - cosine clamped to [-1+eps, 1-eps] to prevent exp overflow
         cosine = F.linear(F.normalize(input), F.normalize(self.weight))  # [bs, out_features]
 
         # If no label provided, return raw cosine similarity (m=0 state)

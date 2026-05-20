@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = BASE_DIR.parent.parent
+PROJECT_ROOT = BASE_DIR.parent
 
 SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
 SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))

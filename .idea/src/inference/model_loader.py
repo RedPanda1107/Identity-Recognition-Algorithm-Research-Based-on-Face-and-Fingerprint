@@ -17,8 +17,8 @@ sys.path.insert(0, str(project_root))
 from core.models import (
     FaceNet, create_face_model,
     FingerprintNet, create_fingerprint_model,
-    SimpleFusionModel, AdaptiveFusionModel, GatedFusionModel, HierarchicalFusionModel,
-    create_fusion_model,
+    FusionModel,
+    create_model,
 )
 
 logger = logging.getLogger("ModelLoader")
@@ -28,10 +28,8 @@ class ModelLoader:
     """统一模型加载器，支持加载人脸/指纹/融合预训练模型并缓存实例"""
 
     FUSION_METHODS = {
-        "simple": SimpleFusionModel,
-        "adaptive": AdaptiveFusionModel,
-        "gated": GatedFusionModel,
-        "hierarchical": HierarchicalFusionModel,
+        "simple": "simple",
+        "adaptive": "adaptive",
     }
 
     def __init__(self, device: str = "auto", checkpoint_dir: Optional[str] = None,
@@ -137,7 +135,7 @@ class ModelLoader:
 
     def load_fusion_model(
         self,
-        method: Literal["simple", "adaptive", "gated", "hierarchical"] = "simple",
+        method: Literal["simple", "adaptive"] = "simple",
         checkpoint_path: Optional[str] = None,
     ) -> torch.nn.Module:
         """加载融合模型"""
@@ -146,8 +144,9 @@ class ModelLoader:
             logger.info(f"[ModelLoader] Fusion model ({method}) loaded from cache")
             return self._cache[cache_key]
 
-        model = create_fusion_model(
-            fusion_method=method,
+        model = create_model(
+            "fusion",
+            fusion_strategy=method,
             face_embedding_dim=self.embedding_dim,
             fingerprint_embedding_dim=self.embedding_dim,
             num_classes=self.num_classes,
