@@ -62,7 +62,7 @@ class GalleryManager:
         self._load()
 
     def _load(self):
-        """从文件加载 Gallery 数据"""
+        """从文件加载 Gallery 数据，合并人脸和指纹特征"""
         face_file = self.gallery_dir / "features" / "face_features.json"
         fp_file = self.gallery_dir / "features" / "fingerprint_features.json"
 
@@ -73,9 +73,42 @@ class GalleryManager:
             self._data = face_data
         elif fp_data:
             self._data = fp_data
+        else:
+            self._data = {
+                "version": self.VERSION,
+                "created_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat(),
+                "users": {},
+            }
 
         if not self._data.get("users"):
             self._data["users"] = {}
+
+        if fp_data:
+            for uid, udata in fp_data.get("users", {}).items():
+                if uid not in self._data["users"]:
+                    self._data["users"][uid] = {}
+                fp_feat = udata.get("fingerprint_feature")
+                if fp_feat:
+                    self._data["users"][uid]["fingerprint_feature"] = fp_feat
+                if not self._data["users"][uid].get("name") and udata.get("name"):
+                    self._data["users"][uid]["name"] = udata.get("name")
+                for k in ("registered_at", "updated_at", "fingerprint_image_path", "face_image_path"):
+                    if udata.get(k) and not self._data["users"][uid].get(k):
+                        self._data["users"][uid][k] = udata[k]
+
+        # 迁移旧格式路径（001_face.jpg → 001/face.jpg）到新目录结构
+        for uid, udata in self._data["users"].items():
+            if udata.get("face_image_path"):
+                old = udata["face_image_path"]
+                new = f"data/gallery/images/{uid}/face.jpg"
+                if old and not old.startswith(f"{uid}/") and "gallery/images" in old:
+                    udata["face_image_path"] = new
+            if udata.get("fingerprint_image_path"):
+                old = udata["fingerprint_image_path"]
+                new = f"data/gallery/images/{uid}/fingerprint.jpg"
+                if old and not old.startswith(f"{uid}/") and "gallery/images" in old:
+                    udata["fingerprint_image_path"] = new
 
         logger.info(f"[Gallery] Loaded {len(self._data['users'])} users")
 
@@ -103,8 +136,6 @@ class GalleryManager:
         face_file = self.gallery_dir / "features" / "face_features.json"
         fp_file = self.gallery_dir / "features" / "fingerprint_features.json"
 
-        # 分别保存人脸和指纹特征到独立文件（避免相互覆盖）
-        # face_features.json 只含 face_feature
         face_out = dict(self._data)
         face_out["users"] = {}
         for uid, udata in self._data["users"].items():
@@ -113,11 +144,11 @@ class GalleryManager:
                 "updated_at": udata.get("updated_at"),
                 "name": udata.get("name"),
                 "face_feature": udata.get("face_feature", []),
+                "face_image_path": udata.get("face_image_path"),
             }
         with open(face_file, "w", encoding="utf-8") as f:
             json.dump(face_out, f, ensure_ascii=False, indent=2)
 
-        # fingerprint_features.json 只含 fingerprint_feature
         fp_out = dict(self._data)
         fp_out["users"] = {}
         for uid, udata in self._data["users"].items():
@@ -126,6 +157,7 @@ class GalleryManager:
                 "updated_at": udata.get("updated_at"),
                 "name": udata.get("name"),
                 "fingerprint_feature": udata.get("fingerprint_feature", []),
+                "fingerprint_image_path": udata.get("fingerprint_image_path"),
             }
         with open(fp_file, "w", encoding="utf-8") as f:
             json.dump(fp_out, f, ensure_ascii=False, indent=2)

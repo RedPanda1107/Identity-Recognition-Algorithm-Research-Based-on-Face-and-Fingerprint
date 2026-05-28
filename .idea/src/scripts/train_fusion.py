@@ -191,7 +191,7 @@ def main():
         logger.info(f"消融模式：人脸置零，测试单用指纹")
     logger.info(f"=" * 60)
 
-    # TensorBoard
+    # TensorBoardcd D:\VSpro\1.0\.idea\src
     writer = SummaryWriter(log_dir=log_dir) if config.get('misc', {}).get('use_tensorboard', False) else None
     seed = config.get('misc', {}).get('seed', 42)
     set_seed(seed)

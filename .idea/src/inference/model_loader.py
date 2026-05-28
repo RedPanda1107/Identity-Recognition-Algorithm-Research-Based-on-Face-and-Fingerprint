@@ -57,12 +57,27 @@ class ModelLoader:
 
         logger.info(f"[ModelLoader] device={self.device}, checkpoint_dir={self.checkpoint_dir}")
 
-    def _find_checkpoint(self, pattern: str) -> Optional[str]:
-        """在 checkpoint 目录中查找匹配的模型文件"""
-        matches = list(self.checkpoint_dir.rglob(pattern))
-        if not matches:
-            matches = list((project_root / "scripts" / "checkpoints").rglob(pattern))
-        return str(matches[0]) if matches else None
+    def _find_checkpoint(self, pattern: str, subdir: str = "") -> Optional[str]:
+        """在 checkpoint 目录的子目录中查找匹配的模型文件"""
+        search_root = self.checkpoint_dir / subdir if subdir else self.checkpoint_dir
+        if search_root.exists():
+            matches = list(search_root.rglob(pattern))
+            if matches:
+                return str(matches[0])
+        extra = list((project_root / "scripts" / "checkpoints").rglob(pattern))
+        return str(extra[0]) if extra else None
+
+    def _find_checkpoint_priority(self, patterns: list[str]) -> Optional[str]:
+        """多模式优先级查找，取第一个命中的"""
+        for pattern in patterns:
+            matches = list(self.checkpoint_dir.rglob(pattern))
+            if matches:
+                return str(matches[0])
+        for pattern in patterns:
+            extra = list((project_root / "scripts" / "checkpoints").rglob(pattern))
+            if extra:
+                return str(extra[0])
+        return None
 
     def _load_state_dict(self, path: str, model: torch.nn.Module) -> bool:
         """安全加载 state_dict"""
@@ -91,7 +106,7 @@ class ModelLoader:
         model.eval()
 
         if checkpoint_path is None:
-            checkpoint_path = self._find_checkpoint("best_face*.pth")
+            checkpoint_path = self._find_checkpoint("best.pth", subdir="face")
         if checkpoint_path and os.path.exists(checkpoint_path):
             if self._load_state_dict(checkpoint_path, model):
                 logger.info(f"[ModelLoader] Face model loaded: {checkpoint_path}")
@@ -120,7 +135,7 @@ class ModelLoader:
         model.eval()
 
         if checkpoint_path is None:
-            checkpoint_path = self._find_checkpoint("best_fingerprint*.pth")
+            checkpoint_path = self._find_checkpoint("best.pth", subdir="fingerprint")
         if checkpoint_path and os.path.exists(checkpoint_path):
             if self._load_state_dict(checkpoint_path, model):
                 logger.info(f"[ModelLoader] Fingerprint model loaded: {checkpoint_path}")
@@ -156,7 +171,7 @@ class ModelLoader:
         model.eval()
 
         if checkpoint_path is None:
-            checkpoint_path = self._find_checkpoint(f"best_{method}.pth")
+            checkpoint_path = self._find_checkpoint("best.pth", subdir=f"fusion/fusion_{method}")
         if checkpoint_path and os.path.exists(checkpoint_path):
             if self._load_state_dict(checkpoint_path, model):
                 logger.info(f"[ModelLoader] Fusion model ({method}) loaded: {checkpoint_path}")

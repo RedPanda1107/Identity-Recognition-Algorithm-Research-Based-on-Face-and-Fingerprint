@@ -45,12 +45,12 @@ def _load_image(path: str) -> Image.Image:
 
 
 def _save_image_to_gallery(image: Image.Image, user_id: str, modality: str, project_root: Path) -> str:
-    """将图片保存到 Gallery 的 images 目录，返回相对路径"""
-    images_dir = project_root / "data" / "gallery" / "images"
+    """将图片保存到 Gallery 的 images/{user_id}/ 目录，返回相对路径"""
+    images_dir = project_root / "data" / "gallery" / "images" / user_id
     images_dir.mkdir(parents=True, exist_ok=True)
 
     ext = "jpg"
-    filename = f"{user_id}_{modality}.{ext}"
+    filename = f"{modality}.{ext}"
     filepath = images_dir / filename
 
     if image.mode == "RGBA":

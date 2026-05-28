@@ -44,7 +44,6 @@ class MatchingService:
         query_feature: np.ndarray,
         top_k: int = 5,
         modality: Literal["face", "fingerprint", "fusion"] = "fusion",
-        score_threshold: float = 0.0,
     ) -> List[Dict[str, Any]]:
         """将查询特征与 Gallery 匹配，返回 Top-K 结果
 
@@ -52,12 +51,11 @@ class MatchingService:
             query_feature: 查询特征向量 [D] 或 [1, D]
             top_k: 返回前 k 个候选
             modality: 模态标识（用于日志）
-            score_threshold: 最低相似度阈值
 
         Returns:
             [
-                {"user_id": "001", "confidence": 0.95, "rank": 1},
-                {"user_id": "042", "confidence": 0.72, "rank": 2},
+                {"user_id": "001", "rank": 1},
+                {"user_id": "042", "rank": 2},
                 ...
             ]
         """
@@ -85,16 +83,10 @@ class MatchingService:
 
         results = []
         for rank, idx in enumerate(top_indices, 1):
-            conf = float(scores[idx])
-            if conf >= score_threshold:
-                results.append({
-                    "user_id": self._gallery_ids[idx],
-                    "confidence": round(conf, 4),
-                    "rank": rank,
-                    "modality": modality,
-                })
-
-        logger.debug(f"[Matching] Top-1 confidence: {results[0]['confidence'] if results else 'N/A'}")
+            results.append({
+                "user_id": self._gallery_ids[idx],
+                "rank": rank,
+            })
         return results
 
     def match_multi_modal(
@@ -105,9 +97,9 @@ class MatchingService:
         gallery_face: List[np.ndarray],
         gallery_fp: List[np.ndarray],
         gallery_ids: List[str],
+        gallery_fp_ids: List[str],
         fusion_weights: tuple[float, float] = (0.5, 0.5),
         top_k: int = 5,
-        score_threshold: float = 0.0,
     ) -> List[Dict[str, Any]]:
         """多模态融合匹配（独立计算人脸和指纹相似度后加权）
 
@@ -117,25 +109,19 @@ class MatchingService:
             fused_feature: 查询融合特征
             gallery_face: Gallery 人脸特征列表
             gallery_fp: Gallery 指纹特征列表
-            gallery_ids: Gallery 用户 ID
+            gallery_ids: Gallery 用户 ID（人脸侧）
+            gallery_fp_ids: Gallery 用户 ID（指纹侧）
             fusion_weights: (人脸权重, 指纹权重)，默认 (0.5, 0.5)
             top_k: 返回前 k 个候选
-            score_threshold: 最低相似度阈值
 
         Returns:
             [
-                {
-                    "user_id": "001",
-                    "confidence": 0.97,
-                    "face_confidence": 0.95,
-                    "fingerprint_confidence": 0.92,
-                    "rank": 1,
-                },
+                {"user_id": "001", "rank": 1},
                 ...
             ]
         """
-        if len(gallery_face) != len(gallery_fp) or len(gallery_face) != len(gallery_ids):
-            raise ValueError("Gallery 特征与 ID 列表长度不一致")
+        if not gallery_face or not gallery_fp:
+            return []
 
         face_w, fp_w = fusion_weights
         face_w = float(face_w)
@@ -144,39 +130,29 @@ class MatchingService:
         query_face = np.asarray(face_feature, dtype=np.float32).flatten()
         query_fp = np.asarray(fp_feature, dtype=np.float32).flatten()
 
-        face_scores = []
-        fp_scores = []
+        def cos(a, b):
+            n = np.dot(a, b)
+            d = (np.linalg.norm(a) * np.linalg.norm(b))
+            return float(n / d) if d > 0 else 0.0
 
-        for g_face, g_fp in zip(gallery_face, gallery_fp):
-            g_face = np.asarray(g_face, dtype=np.float32).flatten()
-            g_fp = np.asarray(g_fp, dtype=np.float32).flatten()
+        face_dict = {uid: np.asarray(feat, dtype=np.float32).flatten()
+                     for uid, feat in zip(gallery_ids, gallery_face)}
+        fp_dict = {uid: np.asarray(feat, dtype=np.float32).flatten()
+                   for uid, feat in zip(gallery_fp_ids, gallery_fp)}
 
-            def cos(a, b):
-                n = np.dot(a, b)
-                d = (np.linalg.norm(a) * np.linalg.norm(b))
-                return float(n / d) if d > 0 else 0.0
+        combined = []
+        for uid in gallery_ids:
+            g_face = face_dict.get(uid)
+            g_fp = fp_dict.get(uid)
+            if g_face is None or g_fp is None:
+                continue
+            face_s = cos(query_face, g_face)
+            fp_s = cos(query_fp, g_fp)
+            score = face_w * face_s + fp_w * fp_s
+            combined.append((uid, score))
 
-            face_scores.append(cos(query_face, g_face))
-            fp_scores.append(cos(query_fp, g_fp))
-
-        face_scores = np.array(face_scores)
-        fp_scores = np.array(fp_scores)
-        combined_scores = face_w * face_scores + fp_w * fp_scores
-
-        top_indices = np.argsort(combined_scores)[::-1][:top_k]
-
-        results = []
-        for rank, idx in enumerate(top_indices, 1):
-            conf = float(combined_scores[idx])
-            if conf >= score_threshold:
-                results.append({
-                    "user_id": gallery_ids[idx],
-                    "confidence": round(conf, 4),
-                    "face_confidence": round(float(face_scores[idx]), 4),
-                    "fingerprint_confidence": round(float(fp_scores[idx]), 4),
-                    "rank": rank,
-                })
-
+        combined.sort(key=lambda x: x[1], reverse=True)
+        results = [{"user_id": uid, "rank": rank} for rank, (uid, _) in enumerate(combined[:top_k], 1)]
         return results
 
     def clear_gallery(self):

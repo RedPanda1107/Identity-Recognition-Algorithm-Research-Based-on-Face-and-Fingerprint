@@ -3,7 +3,7 @@ Pydantic 请求/响应模型定义
 """
 
 from typing import Optional, List
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class RegisterRequest(BaseModel):
@@ -29,12 +29,12 @@ class RecognizeRequest(BaseModel):
     fingerprint_image: Optional[str] = Field(None, description="指纹图片 Base64 编码")
     fingerprint_image_path: Optional[str] = Field(None, description="指纹图片路径（二选一）")
     top_k: int = Field(5, ge=1, le=20, description="返回前 k 个候选")
-    fusion_method: str = Field("simple", description="融合方法: simple / adaptive")
+    fusion_method: str = Field("adaptive", description="融合方法: simple / adaptive")
     fusion_weight_face: float = Field(0.5, ge=0.0, le=1.0)
     fusion_weight_fp: float = Field(0.5, ge=0.0, le=1.0)
-    score_threshold: float = Field(0.0, ge=0.0, le=1.0)
 
-    @validator("face_image", "fingerprint_image", "face_image_path", "fingerprint_image_path")
+    @field_validator("face_image", "fingerprint_image", "face_image_path", "fingerprint_image_path")
+    @classmethod
     def _empty_to_none(cls, v):
         if v == "":
             return None
@@ -43,7 +43,6 @@ class RecognizeRequest(BaseModel):
 
 class Candidate(BaseModel):
     user_id: str
-    confidence: float
     rank: int
 
 
@@ -52,9 +51,6 @@ class RecognizeResponse(BaseModel):
     matched: bool
     user_id: Optional[str] = None
     name: Optional[str] = None
-    confidence: Optional[float] = None
-    face_confidence: Optional[float] = None
-    fingerprint_confidence: Optional[float] = None
     face_image: Optional[str] = None
     candidates: List[Candidate] = []
     modality: str = "fusion"

@@ -83,9 +83,10 @@ class FingerprintInferencer:
         if isinstance(image, (str, Path)):
             image = Image.open(str(image)).convert("RGB")
         elif isinstance(image, torch.Tensor):
-            return image.unsqueeze(0) if image.dim() == 3 else image
+            t = image.unsqueeze(0) if image.dim() == 3 else image
+            return t.to(self.loader.device)
         tensor = self.preprocessor.preprocess(image)
-        return tensor.unsqueeze(0)
+        return tensor.unsqueeze(0).to(self.loader.device)
 
     def extract(self, image) -> torch.Tensor:
         tensor = self.preprocess_image(image)

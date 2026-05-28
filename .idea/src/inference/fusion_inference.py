@@ -141,6 +141,7 @@ class FusionInferencer:
         fused = F.normalize(fused, p=2, dim=1).cpu().numpy()
         return fused
 
+    @torch.no_grad()
     def extract_all(
         self,
         face_image,
