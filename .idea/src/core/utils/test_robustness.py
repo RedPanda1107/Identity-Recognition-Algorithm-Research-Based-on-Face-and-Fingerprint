@@ -36,7 +36,7 @@ from PIL import Image
 from torchvision import transforms
 from tqdm import tqdm
 
-project_root = Path(__file__).resolve().parent.parent
+project_root = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 from core.utils import set_seed, setup_logger, get_device

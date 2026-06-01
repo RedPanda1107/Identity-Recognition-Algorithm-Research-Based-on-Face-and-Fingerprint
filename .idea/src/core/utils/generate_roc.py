@@ -4,12 +4,12 @@
 加载 best.pth → 提取 gallery/query 特征 → 计算余弦相似度 → 绘制 ROC 曲线。
 
 用法:
-    python scripts/generate_roc.py --modality face
-    python scripts/generate_roc.py --modality fingerprint
-    python scripts/generate_roc.py --modality fusion_full
-    python scripts/generate_roc.py --modality fusion_fp_ablation
-    python scripts/generate_roc.py --modality fusion_face_ablation
-    python scripts/generate_roc.py --all
+    python tools/generate_roc.py --modality face
+    python tools/generate_roc.py --modality fingerprint
+    python tools/generate_roc.py --modality fusion_full
+    python tools/generate_roc.py --modality fusion_fp_ablation
+    python tools/generate_roc.py --modality fusion_face_ablation
+    python tools/generate_roc.py --all
 """
 import os, sys, argparse
 from pathlib import Path
@@ -26,7 +26,7 @@ from PIL import Image
 import torchvision.transforms as T
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
-proj_root  = os.path.dirname(os.path.dirname(script_dir))   # .idea/
+proj_root  = os.path.dirname(os.path.dirname(os.path.dirname(script_dir)))   # .idea/
 src_root   = os.path.join(proj_root, "src")
 sys.path.insert(0, src_root)
 

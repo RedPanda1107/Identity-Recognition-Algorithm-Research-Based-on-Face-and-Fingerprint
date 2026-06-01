@@ -33,7 +33,7 @@ from dataclasses import dataclass, asdict, field
 from typing import Optional, Dict, Any, List
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 GALLERY_FEATURES_DIR = PROJECT_ROOT / "data" / "gallery" / "features"
 GALLERY_IMAGES_DIR = PROJECT_ROOT / "data" / "gallery" / "images"
 OUTPUTS_DIR = PROJECT_ROOT / "outputs"
