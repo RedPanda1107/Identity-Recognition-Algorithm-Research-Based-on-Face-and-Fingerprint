@@ -175,9 +175,10 @@ def collect_scores(q_emb, g_emb, q_lbl, g_lbl, seed=42):
     return np.array(pos), np.array(neg)
 
 
-def _eer(fpr, tpr, th):
+def _eer_with_threshold(fpr, tpr, th):
     fnr = 1 - tpr
-    return (fpr[np.nanargmin(np.abs(fpr - fnr))] + fnr[np.nanargmin(np.abs(fpr - fnr))]) / 2
+    idx = np.nanargmin(np.abs(fpr - fnr))
+    return (fpr[idx] + fnr[idx]) / 2, th[idx]
 
 
 def plot_single(pos, neg, label, color, out_path):
@@ -185,7 +186,7 @@ def plot_single(pos, neg, label, color, out_path):
     s = np.concatenate([pos, neg])
     fpr, tpr, th = roc_curve(y, s)
     auc_v = auc(fpr, tpr)
-    eer_v = _eer(fpr, tpr, th)
+    eer_v, eer_th = _eer_with_threshold(fpr, tpr, th)
     plt.figure(figsize=(7, 6))
     plt.plot(fpr, tpr, color=color, lw=2.5, label=f'{label}  (AUC={auc_v:.4f}, EER={eer_v:.4f})')
     plt.plot([0, 1], [0, 1], 'k--', lw=1, alpha=0.6, label='Random')
@@ -197,18 +198,18 @@ def plot_single(pos, neg, label, color, out_path):
     plt.xlim([0, 1]); plt.ylim([0, 1.02])
     plt.tight_layout()
     plt.savefig(out_path, dpi=150); plt.close()
-    print(f"  → {Path(out_path).name}  AUC={auc_v:.4f}  EER={eer_v:.4f}")
-    return auc_v, eer_v
+    print(f"  → {Path(out_path).name}  AUC={auc_v:.4f}  EER={eer_v:.4f}  threshold={eer_th:.4f}")
+    return auc_v, eer_v, eer_th
 
 
 def plot_combined(all_res, out_path):
     plt.figure(figsize=(9, 7))
-    for label, pos, neg, color in all_res:
+    for pos, neg, label, color, _ in all_res:
         y = np.concatenate([np.ones_like(pos), np.zeros_like(neg)])
         s = np.concatenate([pos, neg])
         fpr, tpr, th = roc_curve(y, s)
         auc_v = auc(fpr, tpr)
-        eer_v = _eer(fpr, tpr, th)
+        eer_v, _ = _eer_with_threshold(fpr, tpr, th)
         plt.plot(fpr, tpr, color=color, lw=2.5, label=f'{label}  (AUC={auc_v:.4f}, EER={eer_v:.4f})')
     plt.plot([0, 1], [0, 1], 'k--', lw=1, alpha=0.6, label='Random')
     plt.xlabel('FPR', fontsize=13); plt.ylabel('TPR', fontsize=13)
@@ -327,8 +328,8 @@ def run_single(mod):
     print(f"  Positive: {len(pos)} | Negative: {len(neg)}")
     out_dir = Path(src_root) / "results" / "roc_curves"
     out_dir.mkdir(parents=True, exist_ok=True)
-    auc_v, eer_v = plot_single(pos, neg, name, COLORS[0], str(out_dir / f"roc_{mod}.png"))
-    return pos, neg, name, COLORS[0]
+    auc_v, eer_v, eer_th = plot_single(pos, neg, name, COLORS[0], str(out_dir / f"roc_{mod}.png"))
+    return pos, neg, name, COLORS[0], eer_th
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -358,7 +359,7 @@ def run_fusion(mod):
         modality="fusion", num_classes=mc["num_classes"],
         face_embedding_dim=mc["face_embedding_dim"],
         fingerprint_embedding_dim=mc["fingerprint_embedding_dim"],
-        fusion_dim=mc["fusion_dim"], fusion_method="adaptive",
+        fusion_dim=mc["fusion_dim"], fusion_strategy="adaptive",
     ).to(dev)
     if not fusion_ckpt.exists():
         print(f"  [WARN] Not found: {fusion_ckpt}"); return None
@@ -428,16 +429,7 @@ def run_fusion(mod):
         spatial_attention=fc["model"].get("spatial_attention", False),
     ).to(dev)
 
-    # 尝试从 fusion checkpoint 加载 jointly trained backbone
-    loaded_from_fusion, _ = _load_backbones_from_fusion_ckpt(face_m, fp_m, fusion_ckpt, dev)
-    if not loaded_from_fusion:
-        face_out = str(Path(src_root) / "outputs" / "face")
-        bp, ba = _find_best_ckpt(face_out, dev)
-        if bp:
-            _load_ckpt(face_m, bp, dev)
-            print(f"  Face checkpoint: {Path(bp).name} (val_acc={ba:.4f})")
-
-    # FP backbone
+    # FP backbone (must be created before _load_backbones_from_fusion_ckpt)
     fpc = load_config(str(cfg_dir / "fingerprint_config.yaml"))
     fp_m = create_model(
         modality="fingerprint", model_type="fingerprint_net",
@@ -447,7 +439,15 @@ def run_fusion(mod):
         dropout_rate=fpc["model"].get("dropout_rate", 0.5),
     ).to(dev)
 
+    # 尝试从 fusion checkpoint 加载 jointly trained backbone
+    loaded_from_fusion, _ = _load_backbones_from_fusion_ckpt(face_m, fp_m, fusion_ckpt, dev)
     if not loaded_from_fusion:
+        face_out = str(Path(src_root) / "outputs" / "face")
+        bp, ba = _find_best_ckpt(face_out, dev)
+        if bp:
+            _load_ckpt(face_m, bp, dev)
+            print(f"  Face checkpoint: {Path(bp).name} (val_acc={ba:.4f})")
+
         fp_out = str(Path(src_root) / "outputs" / "fingerprint")
         bp, ba = _find_best_ckpt(fp_out, dev)
         if bp:
@@ -494,8 +494,8 @@ def run_fusion(mod):
     print(f"  Positive: {len(pos)} | Negative: {len(neg)}")
     out_dir = Path(src_root) / "results" / "roc_curves"
     out_dir.mkdir(parents=True, exist_ok=True)
-    auc_v, eer_v = plot_single(pos, neg, name, COLORS[0], str(out_dir / f"roc_{mod}.png"))
-    return pos, neg, name, COLORS[0]
+    auc_v, eer_v, eer_th = plot_single(pos, neg, name, COLORS[0], str(out_dir / f"roc_{mod}.png"))
+    return pos, neg, name, COLORS[0], eer_th
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -515,11 +515,14 @@ def main():
     results = []
     for m in mods:
         r = run_fusion(m) if "fusion" in m else run_single(m)
-        if r: results.append(r)
+        if r:
+            results.append(r)
+            _, _, name, _, eer_th = r
+            print(f"  [{m}] EER threshold = {eer_th:.4f}  (cosine similarity)")
 
     if len(results) > 1:
         out_dir = Path(src_root) / "results" / "roc_curves"
-        plot_combined(results, str(out_dir / "roc_all_modalities.png"))
+        plot_combined([r[:4] for r in results], str(out_dir / "roc_all_modalities.png"))
 
     print(f"\nDone → {Path(src_root)/'results'/'roc_curves'}")
 

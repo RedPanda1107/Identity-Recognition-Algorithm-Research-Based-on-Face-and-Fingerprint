@@ -49,7 +49,7 @@ class GalleryManager:
         if gallery_dir:
             self.gallery_dir = Path(gallery_dir)
         else:
-            project_root = Path(__file__).resolve().parent.parent.parent
+            project_root = Path(__file__).resolve().parent.parent  # inference/ -> src/
             self.gallery_dir = project_root / "data" / "gallery"
 
         self.auto_save = auto_save

@@ -32,6 +32,8 @@ class RecognizeRequest(BaseModel):
     fusion_method: str = Field("adaptive", description="融合方法: simple / adaptive")
     fusion_weight_face: float = Field(0.5, ge=0.0, le=1.0)
     fusion_weight_fp: float = Field(0.5, ge=0.0, le=1.0)
+    score_threshold: Optional[float] = Field(None, ge=0.0, le=1.0,
+                                             description="匹配阈值，不填则使用配置文件默认值")
 
     @field_validator("face_image", "fingerprint_image", "face_image_path", "fingerprint_image_path")
     @classmethod
@@ -44,6 +46,7 @@ class RecognizeRequest(BaseModel):
 class Candidate(BaseModel):
     user_id: str
     rank: int
+    score: Optional[float] = Field(None, description="余弦相似度分数")
 
 
 class RecognizeResponse(BaseModel):
@@ -55,6 +58,8 @@ class RecognizeResponse(BaseModel):
     candidates: List[Candidate] = []
     modality: str = "fusion"
     fusion_method: Optional[str] = None
+    score: Optional[float] = Field(None, description="Rank-1 匹配的余弦相似度分数")
+    score_threshold: Optional[float] = Field(None, description="本次识别使用的阈值")
 
 
 class UserInfo(BaseModel):

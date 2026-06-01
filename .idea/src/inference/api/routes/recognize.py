@@ -67,20 +67,23 @@ def recognize_face(request: RecognizeRequest):
         raise HTTPException(status_code=400, detail="Gallery 为空，请先注册用户")
 
     matching.set_gallery(features, ids)
-    results = matching.match(face_feature, top_k=request.top_k,
-                             modality="face", score_threshold=request.score_threshold)
+    results = matching.match(face_feature, top_k=request.top_k, modality="face")
+
+    from ...config import MATCH_SCORE_THRESHOLD
+    threshold = request.score_threshold if request.score_threshold is not None else MATCH_SCORE_THRESHOLD
 
     if not results:
-        return RecognizeResponse(success=True, matched=False, candidates=[], modality="face")
+        return RecognizeResponse(success=True, matched=False, candidates=[], modality="face", score_threshold=threshold)
 
     top = results[0]
     return RecognizeResponse(
         success=True,
-        matched=top["confidence"] >= request.score_threshold,
+        matched=top["score"] >= threshold,
         user_id=top["user_id"],
-        confidence=top["confidence"],
         candidates=[Candidate(**r) for r in results],
         modality="face",
+        score=top["score"],
+        score_threshold=threshold,
     )
 
 
@@ -100,20 +103,23 @@ def recognize_fingerprint(request: RecognizeRequest):
         raise HTTPException(status_code=400, detail="Gallery 为空，请先注册用户")
 
     matching.set_gallery(features, ids)
-    results = matching.match(fp_feature, top_k=request.top_k,
-                             modality="fingerprint", score_threshold=request.score_threshold)
+    results = matching.match(fp_feature, top_k=request.top_k, modality="fingerprint")
+
+    from ...config import MATCH_SCORE_THRESHOLD
+    threshold = request.score_threshold if request.score_threshold is not None else MATCH_SCORE_THRESHOLD
 
     if not results:
-        return RecognizeResponse(success=True, matched=False, candidates=[], modality="fingerprint")
+        return RecognizeResponse(success=True, matched=False, candidates=[], modality="fingerprint", score_threshold=threshold)
 
     top = results[0]
     return RecognizeResponse(
         success=True,
-        matched=top["confidence"] >= request.score_threshold,
+        matched=top["score"] >= threshold,
         user_id=top["user_id"],
-        confidence=top["confidence"],
         candidates=[Candidate(**r) for r in results],
         modality="fingerprint",
+        score=top["score"],
+        score_threshold=threshold,
     )
 
 
@@ -210,6 +216,18 @@ def recognize_fusion(request: RecognizeRequest):
     # 填充 name 和 face_image
     name = None
     face_image_b64 = None
+
+    # 获取阈值（请求覆盖 > 配置默认值）
+    from ...config import MATCH_SCORE_THRESHOLD
+    threshold = request.score_threshold if request.score_threshold is not None else MATCH_SCORE_THRESHOLD
+
+    # 阈值判断：分数不够则拒绝认证
+    top_score = results[0]["score"] if results else None
+    if top_score is not None and top_score >= threshold:
+        matched_user_id = results[0]["user_id"]
+    else:
+        matched_user_id = None
+
     if matched_user_id:
         user_data = gallery.get_user(matched_user_id)
         if user_data:
@@ -230,7 +248,9 @@ def recognize_fusion(request: RecognizeRequest):
         user_id=matched_user_id,
         name=name,
         face_image=face_image_b64,
-        candidates=[Candidate(user_id=r["user_id"], rank=r["rank"]) for r in results],
+        candidates=[Candidate(**r) for r in results],
         modality=modality_tag,
         fusion_method=request.fusion_method,
+        score=top_score,
+        score_threshold=threshold,
     )

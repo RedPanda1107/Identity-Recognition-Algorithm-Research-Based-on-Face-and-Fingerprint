@@ -11,7 +11,7 @@ from typing import Optional, Dict, Any, Literal
 
 import torch
 
-project_root = Path(__file__).resolve().parent.parent.parent
+project_root = Path(__file__).resolve().parent.parent  # inference/ -> src/
 sys.path.insert(0, str(project_root))
 
 from core.models import (

@@ -86,6 +86,7 @@ class MatchingService:
             results.append({
                 "user_id": self._gallery_ids[idx],
                 "rank": rank,
+                "score": float(scores[idx]),
             })
         return results
 
@@ -152,7 +153,8 @@ class MatchingService:
             combined.append((uid, score))
 
         combined.sort(key=lambda x: x[1], reverse=True)
-        results = [{"user_id": uid, "rank": rank} for rank, (uid, _) in enumerate(combined[:top_k], 1)]
+        results = [{"user_id": uid, "rank": rank, "score": score}
+                   for rank, (uid, score) in enumerate(combined[:top_k], 1)]
         return results
 
     def clear_gallery(self):
