@@ -468,7 +468,6 @@ class FusionDataset(Dataset):
 
         try:
             fp_image = Image.open(sample['fingerprint_path']).convert('RGB')
-            # 应用 CLAHE 增强指纹脊线（训练和验证都应用，与 FingerprintDataset 一致）
             fp_image = self._apply_clahe(fp_image)
         except Exception as e:
             print(f"加载指纹图像失败 {sample['fingerprint_path']}: {e}")

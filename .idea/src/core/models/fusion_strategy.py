@@ -61,11 +61,6 @@ class AttentionStrategy(FusionStrategy):
     通过可学习的 softmax 权重融合两个模态，权重由 MLP 基于两模态的
     均值、差异向量和余弦相似度动态计算。
 
-    融合公式：
-        weights = softmax(MLP([mean; diff; cos_sim]))
-        fused  = weighted_sum(weights, face_feat, fp_feat)
-
-    配合 entropy_penalty_weight > 0 的训练正则化，迫使权重趋向均衡。
     """
 
     def __init__(self, fusion_dim: int, hidden_dim: int = 64):
